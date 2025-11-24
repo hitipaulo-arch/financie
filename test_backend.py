@@ -1,0 +1,273 @@
+"""Testes automatizados para API do Gestor Financeiro."""
+import pytest
+import os
+import tempfile
+from datetime import date
+from backend import create_app, Base, engine
+
+
+@pytest.fixture
+def app():
+    """Cria app Flask para testes com DB temporária."""
+    # Usar DB em memória para testes
+    os.environ["GF_DB_URL"] = "sqlite:///:memory:"
+    app = create_app()
+    app.config['TESTING'] = True
+    
+    with app.app_context():
+        Base.metadata.create_all(engine)
+    
+    yield app
+    
+    # Cleanup
+    with app.app_context():
+        Base.metadata.drop_all(engine)
+
+
+@pytest.fixture
+def client(app):
+    """Cliente de testes Flask."""
+    return app.test_client()
+
+
+class TestHealth:
+    def test_health_endpoint(self, client):
+        """Testa endpoint /api/health."""
+        response = client.get('/api/health')
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['status'] == 'ok'
+
+    def test_root_endpoint(self, client):
+        """Testa endpoint raiz /."""
+        response = client.get('/')
+        assert response.status_code == 200
+        data = response.get_json()
+        assert 'message' in data
+
+
+class TestTransactions:
+    def test_list_empty_transactions(self, client):
+        """Testa listagem vazia inicial."""
+        response = client.get('/api/users/test_user/transactions')
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data == []
+
+    def test_create_transaction(self, client):
+        """Testa criação de transação."""
+        payload = {
+            "description": "Salário Teste",
+            "amount": 3000.50,
+            "type": "income"
+        }
+        response = client.post(
+            '/api/users/test_user/transactions',
+            json=payload,
+            content_type='application/json'
+        )
+        assert response.status_code == 201
+        data = response.get_json()
+        assert data['description'] == "Salário Teste"
+        assert data['amount'] == 3000.50
+        assert data['type'] == "income"
+        assert 'id' in data
+        assert 'date' in data
+
+    def test_create_transaction_with_date(self, client):
+        """Testa criação com data específica."""
+        payload = {
+            "description": "Compra Antiga",
+            "amount": 150.00,
+            "type": "expense",
+            "date": "2025-11-01"
+        }
+        response = client.post('/api/users/test_user/transactions', json=payload)
+        assert response.status_code == 201
+        data = response.get_json()
+        assert data['date'] == "2025-11-01"
+
+    def test_create_invalid_transaction(self, client):
+        """Testa validação de campos inválidos."""
+        payload = {"description": "", "amount": -100, "type": "invalid"}
+        response = client.post('/api/users/test_user/transactions', json=payload)
+        assert response.status_code == 400
+
+    def test_update_transaction(self, client):
+        """Testa atualização de transação."""
+        # Criar
+        payload = {"description": "Original", "amount": 100, "type": "income"}
+        create_resp = client.post('/api/users/test_user/transactions', json=payload)
+        txn_id = create_resp.get_json()['id']
+        
+        # Atualizar
+        update_payload = {"description": "Atualizado", "amount": 200}
+        response = client.patch(f'/api/users/test_user/transactions/{txn_id}', json=update_payload)
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['description'] == "Atualizado"
+        assert data['amount'] == 200
+
+    def test_delete_transaction(self, client):
+        """Testa remoção de transação."""
+        # Criar
+        payload = {"description": "Para Deletar", "amount": 50, "type": "expense"}
+        create_resp = client.post('/api/users/test_user/transactions', json=payload)
+        txn_id = create_resp.get_json()['id']
+        
+        # Deletar
+        response = client.delete(f'/api/users/test_user/transactions/{txn_id}')
+        assert response.status_code == 200
+        
+        # Verificar que foi deletado
+        list_resp = client.get('/api/users/test_user/transactions')
+        assert len(list_resp.get_json()) == 0
+
+    def test_delete_nonexistent_transaction(self, client):
+        """Testa deletar transação inexistente."""
+        response = client.delete('/api/users/test_user/transactions/9999')
+        assert response.status_code == 404
+
+
+class TestInstallments:
+    def test_list_empty_installments(self, client):
+        """Testa listagem vazia de parcelas."""
+        response = client.get('/api/users/test_user/installments')
+        assert response.status_code == 200
+        assert response.get_json() == []
+
+    def test_create_installment(self, client):
+        """Testa criação de parcela."""
+        payload = {
+            "description": "Notebook Parcelado",
+            "monthly_value": 299.90,
+            "total_months": 12
+        }
+        response = client.post('/api/users/test_user/installments', json=payload)
+        assert response.status_code == 201
+        data = response.get_json()
+        assert data['description'] == "Notebook Parcelado"
+        assert data['monthly_value'] == 299.90
+        assert data['total_months'] == 12
+
+    def test_update_installment(self, client):
+        """Testa atualização de parcela."""
+        # Criar
+        payload = {"description": "Original", "monthly_value": 100, "total_months": 6}
+        create_resp = client.post('/api/users/test_user/installments', json=payload)
+        inst_id = create_resp.get_json()['id']
+        
+        # Atualizar
+        update_payload = {"total_months": 10}
+        response = client.patch(f'/api/users/test_user/installments/{inst_id}', json=update_payload)
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['total_months'] == 10
+
+    def test_delete_installment(self, client):
+        """Testa remoção de parcela."""
+        payload = {"description": "Para Deletar", "monthly_value": 50, "total_months": 3}
+        create_resp = client.post('/api/users/test_user/installments', json=payload)
+        inst_id = create_resp.get_json()['id']
+        
+        response = client.delete(f'/api/users/test_user/installments/{inst_id}')
+        assert response.status_code == 200
+
+
+class TestSummary:
+    def test_empty_summary(self, client):
+        """Testa resumo sem transações."""
+        response = client.get('/api/users/test_user/summary')
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['income'] == 0
+        assert data['expenses_total'] == 0
+        assert data['balance'] == 0
+
+    def test_summary_with_transactions(self, client):
+        """Testa cálculo de resumo com transações."""
+        # Criar receita
+        client.post('/api/users/test_user/transactions', 
+                   json={"description": "Salário", "amount": 5000, "type": "income"})
+        
+        # Criar despesa avulsa
+        client.post('/api/users/test_user/transactions',
+                   json={"description": "Aluguel", "amount": 1500, "type": "expense"})
+        
+        # Criar parcela
+        client.post('/api/users/test_user/installments',
+                   json={"description": "Cartão", "monthly_value": 500, "total_months": 12})
+        
+        response = client.get('/api/users/test_user/summary')
+        data = response.get_json()
+        
+        assert data['income'] == 5000
+        assert data['expenses_avulsa'] == 1500
+        assert data['expenses_parcelas'] == 500
+        assert data['expenses_total'] == 2000
+        assert data['balance'] == 3000
+
+
+class TestImport:
+    def test_import_simulated_data(self, client):
+        """Testa importação simulada de extrato."""
+        response = client.post('/api/users/test_user/import')
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['status'] == 'success'
+        assert data['imported'] == 3
+        assert len(data['transactions']) == 3
+        
+        # Verificar que foram criadas
+        list_resp = client.get('/api/users/test_user/transactions')
+        assert len(list_resp.get_json()) == 3
+
+
+class TestOpenFinanceSync:
+    def test_open_finance_sync(self, client):
+        """Testa sincronização simulada via Open Finance."""
+        response = client.post('/api/users/test_user/openfinance/sync')
+        assert response.status_code == 201
+        data = response.get_json()
+        assert data['status'] == 'success'
+        assert data['source'] == 'open_finance_simulated'
+        assert data['imported'] == 3
+        assert len(data['transactions']) == 3
+        # Verifica persistência
+        list_resp = client.get('/api/users/test_user/transactions')
+        assert len(list_resp.get_json()) == 3  # não duplica além das importadas
+
+    def test_open_finance_sync_dedup(self, client):
+        """Segunda sincronização não deve duplicar transações."""
+        first = client.post('/api/users/test_user/openfinance/sync')
+        assert first.status_code == 201
+        data1 = first.get_json()
+        assert data1['imported'] == 3
+        second = client.post('/api/users/test_user/openfinance/sync')
+        assert second.status_code == 201
+        data2 = second.get_json()
+        assert data2['imported'] == 0
+        assert data2['skipped_duplicates'] == 3
+        list_resp = client.get('/api/users/test_user/transactions')
+        assert len(list_resp.get_json()) == 3
+
+
+class TestMultiUser:
+    def test_user_isolation(self, client):
+        """Testa isolamento de dados entre usuários."""
+        # Criar transação para user1
+        client.post('/api/users/user1/transactions',
+                   json={"description": "User1 Txn", "amount": 100, "type": "income"})
+        
+        # Criar transação para user2
+        client.post('/api/users/user2/transactions',
+                   json={"description": "User2 Txn", "amount": 200, "type": "income"})
+        
+        # Verificar isolamento
+        user1_resp = client.get('/api/users/user1/transactions')
+        user2_resp = client.get('/api/users/user2/transactions')
+        
+        assert len(user1_resp.get_json()) == 1
+        assert len(user2_resp.get_json()) == 1
+        assert user1_resp.get_json()[0]['amount'] == 100
+        assert user2_resp.get_json()[0]['amount'] == 200

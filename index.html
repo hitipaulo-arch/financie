@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestor Financeiro Pessoal (Firestore)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f9fc;
+        }
+        .tab-button {
+            transition: all 0.2s;
+        }
+        .input-group label {
+            font-weight: 600;
+            color: #374151;
+            margin-bottom: 4px;
+        }
+        .action-icon {
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+        }
+        .action-icon:hover {
+            background-color: rgba(0, 0, 0, 0.05);
+        }
+    </style>
+</head>
+<body class="p-4 sm:p-8">
+
+    <!-- Main Application Container -->
+    <div id="app" class="max-w-4xl mx-auto bg-white shadow-xl rounded-xl p-4 sm:p-8">
+
+        <h1 class="3xl font-bold text-gray-900 mb-6 text-center">💸 Gestor Financeiro Pessoal</h1>
+        
+        <p id="authStatus" class="text-center text-sm mb-2 text-gray-500">
+            <span id="loadingIndicator" class="animate-pulse">Aguardando autenticação inicial...</span>
+            <br>Usuário ID: <span id="userIdDisplay" class="font-mono text-xs bg-gray-100 p-1 rounded">N/A</span>
+        </p>
+
+        <!-- Botões de Login/Logout -->
+        <div class="text-center mb-6">
+            <button id="signInButton" class="bg-blue-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-700 transition duration-150 hidden" onclick="window.signInWithGoogle()">
+                Entrar com Google
+            </button>
+            <button id="signOutButton" class="bg-gray-400 text-white font-semibold py-2 px-4 rounded-lg hover:bg-gray-500 transition duration-150 hidden" onclick="window.signOutUser()">
+                Sair
+            </button>
+        </div>
+
+        <!-- Dashboard / Summary -->
+        <div id="dashboard" class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+            <!-- Receitas -->
+            <div class="bg-green-100 p-4 rounded-lg shadow-md border-l-4 border-green-500">
+                <p class="text-sm text-gray-600">Receitas Totais</p>
+                <p id="totalIncome" class="text-2xl font-bold text-green-700 mt-1">R$ 0,00</p>
+            </div>
+            <!-- Despesas -->
+            <div class="bg-red-100 p-4 rounded-lg shadow-md border-l-4 border-red-500">
+                <p class="text-sm text-gray-600">Despesas Totais (Mês)</p>
+                <p id="totalExpense" class="text-2xl font-bold text-red-700 mt-1">R$ 0,00</p>
+            </div>
+            <!-- Saldo -->
+            <div class="bg-blue-100 p-4 rounded-lg shadow-md border-l-4 border-blue-500">
+                <p class="text-sm text-gray-600">Saldo Atual</p>
+                <p id="currentBalance" class="text-2xl font-bold text-blue-700 mt-1">R$ 0,00</p>
+            </div>
+        </div>
+        
+        <!-- Tab Navigation -->
+        <div class="flex border-b border-gray-200 mb-6">
+            <button id="tabTransacoes" class="tab-button px-4 py-2 text-sm sm:text-base font-semibold border-b-2 border-indigo-500 text-indigo-600 hover:text-indigo-800" onclick="showTab('transacoes')">
+                Transações Avulsas
+            </button>
+            <button id="tabParcelas" class="tab-button px-4 py-2 text-sm sm:text-base font-semibold border-b-2 border-transparent text-gray-500 hover:text-indigo-600" onclick="showTab('parcelas')">
+                Controle de Parcelas
+            </button>
+        </div>
+
+        <!-- Transaction Tab Content -->
+        <div id="contentTransacoes" class="tab-content">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Novo Lançamento (Receita/Despesa Avulsa)</h2>
+            <form id="transactionForm" class="grid grid-cols-1 sm:grid-cols-3 gap-4 bg-gray-50 p-4 rounded-lg mb-4 shadow-sm">
+                <div class="input-group">
+                    <label for="descricaoTransacao">Descrição</label>
+                    <input type="text" id="descricaoTransacao" required class="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                </div>
+                <div class="input-group">
+                    <label for="valorTransacao">Valor (R$)</label>
+                    <input type="number" id="valorTransacao" step="0.01" required class="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                </div>
+                <div class="input-group">
+                    <label for="tipoTransacao">Tipo</label>
+                    <select id="tipoTransacao" required class="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        <option value="expense">Despesa Avulsa</option>
+                        <option value="income">Receita</option>
+                    </select>
+                </div>
+                <div class="input-group sm:col-span-3">
+                    <button type="submit" id="submitTransacao" disabled class="w-full bg-indigo-600 text-white font-bold py-2 rounded-lg hover:bg-indigo-700 transition duration-150 disabled:opacity-50">
+                        Adicionar Transação
+                    </button>
+                </div>
+            </form>
+            
+            <button id="importButton" disabled onclick="window.importExtratoSimulado()" class="w-full bg-pink-600 text-white font-bold py-2 rounded-lg hover:bg-pink-700 transition duration-150 disabled:opacity-50 mb-6">
+                Importar Extrato (Simulado - Open Finance)
+            </button>
+
+            <h3 class="text-lg font-semibold text-gray-800 mb-3">Histórico de Transações</h3>
+            <div id="transactionList" class="space-y-3">
+                <p class="text-gray-500 italic p-3 text-center bg-gray-100 rounded-lg">Aguardando conexão com o banco de dados...</p>
+                <!-- Transactions will be injected here -->
+            </div>
+        </div>
+
+        <!-- Installment Tab Content -->
+        <div id="contentParcelas" class="tab-content hidden">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Nova Compra Parcelada</h2>
+            <form id="installmentForm" class="grid grid-cols-1 sm:grid-cols-4 gap-4 bg-gray-50 p-4 rounded-lg mb-6 shadow-sm">
+                <div class="input-group sm:col-span-2">
+                    <label for="descricaoParcela">Descrição</label>
+                    <input type="text" id="descricaoParcela" required class="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                </div>
+                <div class="input-group">
+                    <label for="valorMensalParcela">Valor Mensal (R$)</label>
+                    <input type="number" id="valorMensalParcela" step="0.01" required class="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                </div>
+                <div class="input-group">
+                    <label for="totalMesesParcela">Total de Meses</label>
+                    <input type="number" id="totalMesesParcela" required class="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                </div>
+                <div class="input-group sm:col-span-4">
+                    <button type="submit" id="submitParcela" disabled class="w-full bg-indigo-600 text-white font-bold py-2 rounded-lg hover:bg-indigo-700 transition duration-150 disabled:opacity-50">
+                        Adicionar Parcela
+                    </button>
+                </div>
+            </form>
+
+            <h3 class="text-lg font-semibold text-gray-800 mb-3">Parcelas Ativas</h3>
+            <div id="installmentList" class="space-y-3">
+                <p class="text-gray-500 italic p-3 text-center bg-gray-100 rounded-lg">Aguardando conexão com o banco de dados...</p>
+                <!-- Installments will be injected here -->
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        // Importa as funções do Firebase
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, deleteDoc, onSnapshot, collection, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Variáveis globais do Canvas (MANDATÓRIAS)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // Configurações e Instâncias do Firebase
+        let app, db, auth, userId = null;
+        let isAuthReady = false;
+
+        // --- Configuração e Inicialização do Firebase ---
+        try {
+            if (Object.keys(firebaseConfig).length) {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // 1. Tenta autenticar com o token customizado fornecido pela Canvas
+                if (initialAuthToken) {
+                    signInWithCustomToken(auth, initialAuthToken)
+                        .catch(error => {
+                            console.error("Erro ao autenticar com token customizado, tentando anonimamente:", error);
+                            // 2. Fallback: Autenticação Anônima
+                            return signInAnonymously(auth);
+                        });
+                } else {
+                    // 2. Fallback: Autenticação Anônima
+                    signInAnonymously(auth);
+                }
+
+                // EXPOSTA: Função para iniciar sessão com Google
+                window.signInWithGoogle = async () => {
+                    const provider = new GoogleAuthProvider();
+                    try {
+                        // Use signInWithPopup para o fluxo de login
+                        await signInWithPopup(auth, provider);
+                        // O onAuthStateChanged tratará a atualização da UI
+                    } catch (error) {
+                        console.error("Erro no login com Google:", error);
+                    }
+                };
+
+                // EXPOSTA: Função para terminar sessão
+                window.signOutUser = async () => {
+                    try {
+                        await signOut(auth);
+                    } catch (error) {
+                        console.error("Erro ao terminar sessão:", error);
+                    }
+                };
+
+                // Listener de Estado de Autenticação
+                onAuthStateChanged(auth, (user) => {
+                    const signInBtn = document.getElementById('signInButton');
+                    const signOutBtn = document.getElementById('signOutButton');
+                    const importBtn = document.getElementById('importButton');
+                    
+                    if (user) {
+                        userId = user.uid;
+                        isAuthReady = true;
+                        
+                        // Determinar o status de login
+                        const isAnonymous = user.isAnonymous || (user.providerData.length === 0 && !user.email);
+                        const statusText = isAnonymous 
+                            ? 'Conectado (Token Canvas)' 
+                            : `Conectado (Google: ${user.email || 'N/A'})`;
+
+                        document.getElementById('userIdDisplay').textContent = userId;
+                        document.getElementById('loadingIndicator').textContent = statusText;
+
+                        // Habilitar formulários e botões de ação
+                        document.getElementById('submitTransacao').disabled = false;
+                        document.getElementById('submitParcela').disabled = false;
+                        importBtn.disabled = false;
+
+                        // Mostrar botão Sair e esconder Entrar
+                        signOutBtn.classList.remove('hidden');
+                        signInBtn.classList.add('hidden');
+
+                        startDataListeners(db, userId, appId);
+                    } else {
+                        // Utilizador desconectado
+                        userId = null;
+                        isAuthReady = true;
+                        document.getElementById('userIdDisplay').textContent = 'N/A';
+                        document.getElementById('loadingIndicator').textContent = 'Sessão Terminada';
+                        
+                        // Desabilitar formulários e botões de ação
+                        document.getElementById('submitTransacao').disabled = true;
+                        document.getElementById('submitParcela').disabled = true;
+                        importBtn.disabled = true;
+                        
+                        // Mostrar botão Entrar e esconder Sair
+                        signInBtn.classList.remove('hidden');
+                        signOutBtn.classList.add('hidden');
+                    }
+                });
+
+            } else {
+                console.error("A configuração do Firebase não está disponível. O app não funcionará.");
+                document.getElementById('loadingIndicator').textContent = 'Erro de Configuração';
+            }
+        } catch (error) {
+            console.error("Erro na inicialização do Firebase:", error);
+            document.getElementById('loadingIndicator').textContent = 'Erro de Inicialização';
+        }
+
+
+        // --- Variáveis de Estado (Iniciadas Vazias, serão preenchidas por onSnapshot) ---
+        let transactions = [];
+        let installments = [];
+
+        // --- Funções de Escuta (Listeners) ---
+
+        const startDataListeners = (db, currentUserId, currentAppId) => {
+            if (!db || !currentUserId) return;
+
+            // Caminho base para o documento do utilizador: artifacts/appId/users/userId
+            const userDocRef = doc(db, `artifacts/${currentAppId}/users/${currentUserId}`);
+
+            // 1. Listener para Transações Avulsas
+            const transCollectionRef = collection(userDocRef, 'transactions');
+            onSnapshot(transCollectionRef, (snapshot) => {
+                transactions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                updateAll();
+            }, (error) => {
+                console.error("Erro ao buscar transações:", error);
+                document.getElementById('transactionList').innerHTML = '<p class="text-red-500 p-3 text-center">Erro ao carregar transações.</p>';
+            });
+
+            // 2. Listener para Parcelas
+            const instCollectionRef = collection(userDocRef, 'installments');
+            onSnapshot(instCollectionRef, (snapshot) => {
+                installments = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                updateAll();
+            }, (error) => {
+                console.error("Erro ao buscar parcelas:", error);
+                document.getElementById('installmentList').innerHTML = '<p class="text-red-500 p-3 text-center">Erro ao carregar parcelas.</p>';
+            });
+        };
+
+
+        // --- Funções de Utilitário ---
+        const formatCurrency = (value) => {
+            return new Intl.NumberFormat('pt-BR', {
+                style: 'currency',
+                currency: 'BRL',
+            }).format(value);
+        };
+
+        // --- Funções de Cálculo e Dashboard ---
+
+        const calculateInsights = () => {
+            // 1. Receitas: Soma de todas as transações tipo 'income'
+            const totalIncome = transactions
+                .filter(t => t.type === 'income')
+                .reduce((sum, t) => sum + t.amount, 0);
+
+            // 2. Despesas Avulsas: Soma de todas as transações tipo 'expense'
+            const avulsaExpense = transactions
+                .filter(t => t.type === 'expense')
+                .reduce((sum, t) => sum + t.amount, 0);
+
+            // 3. Despesas Parceladas (Valor mensal de todas as ativas)
+            const installmentMonthlyExpense = installments.reduce((sum, i) => sum + i.monthlyValue, 0);
+            
+            // 4. Despesa Total
+            const totalExpense = avulsaExpense + installmentMonthlyExpense;
+            
+            // 5. Saldo
+            const currentBalance = totalIncome - totalExpense;
+
+            return { totalIncome, totalExpense, currentBalance };
+        };
+
+        const updateDashboard = () => {
+            const { totalIncome, totalExpense, currentBalance } = calculateInsights();
+
+            document.getElementById('totalIncome').textContent = formatCurrency(totalIncome);
+            document.getElementById('totalExpense').textContent = formatCurrency(totalExpense);
+            
+            const balanceElement = document.getElementById('currentBalance');
+            balanceElement.textContent = formatCurrency(currentBalance);
+            
+            // Mudar cor do saldo
+            balanceElement.classList.remove('text-green-700', 'text-red-700', 'text-blue-700');
+            if (currentBalance > 0) {
+                balanceElement.classList.add('text-green-700');
+            } else if (currentBalance < 0) {
+                balanceElement.classList.add('text-red-700');
+            } else {
+                balanceElement.classList.add('text-blue-700');
+            }
+        };
+
+        // --- Funções de Renderização ---
+
+        const renderTransactions = () => {
+            const list = document.getElementById('transactionList');
+            list.innerHTML = ''; // Limpa a lista
+            
+            if (transactions.length === 0) {
+                list.innerHTML = '<p class="text-gray-500 italic p-3 text-center bg-gray-100 rounded-lg">Nenhuma transação avulsa registrada ainda.</p>';
+                return;
+            }
+
+            // Ordena localmente por data (descrescente)
+            transactions.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+            transactions.forEach(t => {
+                const isIncome = t.type === 'income';
+                const bgColor = isIncome ? 'bg-green-50' : 'bg-red-50';
+                const textColor = isIncome ? 'text-green-600' : 'text-red-600';
+
+                const item = document.createElement('div');
+                item.className = `flex justify-between items-center p-3 rounded-lg shadow-sm ${bgColor}`;
+                item.innerHTML = `
+                    <div>
+                        <p class="font-semibold text-gray-800">${t.description}</p>
+                        <p class="text-xs text-gray-500">${new Date(t.date).toLocaleDateString('pt-BR')}</p>
+                    </div>
+                    <div class="flex items-center">
+                        <span class="font-bold text-lg ${textColor}">${formatCurrency(t.amount)}</span>
+                        
+                        <!-- BOTÃO DE EDIÇÃO -->
+                        <span class="action-icon ml-2 text-gray-500 hover:text-indigo-600" 
+                            onclick="window.editTransaction('${t.id}', '${t.description}', ${t.amount}, '${t.type}')" 
+                            aria-label="Editar Transação">
+                            ✏️
+                        </span>
+
+                        <!-- BOTÃO DE DELETAR -->
+                        <button onclick="window.deleteTransaction('${t.id}')" class="ml-2 text-gray-400 hover:text-red-500 transition duration-150" aria-label="Deletar transação">
+                            <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 10-2 0v6a1 1 0 102 0V8z" clip-rule="evenodd"></path></svg>
+                        </button>
+                    </div>
+                `;
+                list.appendChild(item);
+            });
+        };
+
+        const renderInstallments = () => {
+            const list = document.getElementById('installmentList');
+            list.innerHTML = ''; // Limpa a lista
+
+            if (installments.length === 0) {
+                list.innerHTML = '<p class="text-gray-500 italic p-3 text-center bg-gray-100 rounded-lg">Nenhuma compra parcelada ativa registrada ainda.</p>';
+                return;
+            }
+
+            installments.forEach(i => {
+                const totalCost = i.monthlyValue * i.totalMonths;
+                const item = document.createElement('div');
+                item.className = `flex justify-between items-center p-3 rounded-lg shadow-sm bg-yellow-50 border-l-4 border-yellow-500`;
+                item.innerHTML = `
+                    <div>
+                        <p class="font-semibold text-gray-800">${i.description}</p>
+                        <p class="text-sm text-gray-600">Mensal: <span class="font-bold text-red-600">${formatCurrency(i.monthlyValue)}</span></p>
+                        <p class="text-xs text-gray-500">Total: ${i.totalMonths}x (${formatCurrency(totalCost)})</p>
+                    </div>
+                    <div class="flex items-center">
+                        <!-- BOTÃO DE EDIÇÃO -->
+                        <span class="action-icon ml-2 text-gray-500 hover:text-indigo-600" 
+                            onclick="window.editInstallment('${i.id}', '${i.description}', ${i.monthlyValue}, ${i.totalMonths})" 
+                            aria-label="Editar Parcela">
+                            ✏️
+                        </span>
+
+                        <!-- BOTÃO DE FINALIZAR (DELETAR) -->
+                        <button onclick="window.deleteInstallment('${i.id}')" class="ml-2 text-gray-400 hover:text-red-500 transition duration-150" aria-label="Finalizar parcela">
+                            <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 10-2 0v6a1 1 0 102 0V8z" clip-rule="evenodd"></path></svg>
+                        </button>
+                    </div>
+                `;
+                list.appendChild(item);
+            });
+        };
+
+        // --- Funções de Manipulação do Firestore ---
+        
+        // Função utilitária para obter a referência base do utilizador
+        const getUserDocRef = () => {
+            if (!userId || !db) return null;
+            // Caminho base para o documento do utilizador: artifacts/appId/users/userId
+            return doc(db, `artifacts/${appId}/users/${userId}`);
+        };
+
+        // EXPOSTA: Edita uma Transação Avulsa
+        window.editTransaction = async (id, currentDescription, currentAmount, currentType) => {
+            const userDocRef = getUserDocRef();
+            if (!userDocRef) return;
+
+            const newDesc = prompt(`Editar Descrição (${currentDescription}):`, currentDescription);
+            if (newDesc === null) return; // Cancelado
+
+            const newAmountStr = prompt(`Editar Valor (R$ ${currentAmount.toFixed(2)}):`, currentAmount.toFixed(2));
+            if (newAmountStr === null) return; // Cancelado
+
+            const newAmount = parseFloat(newAmountStr.replace(',', '.'));
+            
+            if (isNaN(newAmount) || newAmount <= 0) {
+                 console.error("Valor inválido.");
+                 return;
+            }
+
+            const newType = prompt(`Editar Tipo (income/expense - Atual: ${currentType}):`, currentType);
+            if (newType === null) return; // Cancelado
+
+            if (newType !== 'income' && newType !== 'expense') {
+                console.error("Tipo inválido. Deve ser 'income' ou 'expense'.");
+                return;
+            }
+
+            try {
+                const docRef = doc(collection(userDocRef, 'transactions'), id);
+                await updateDoc(docRef, {
+                    description: newDesc.trim(),
+                    amount: newAmount,
+                    type: newType
+                });
+            } catch (error) {
+                console.error("Erro ao editar transação:", error);
+            }
+        };
+
+
+        // EXPOSTA: Edita uma Parcela
+        window.editInstallment = async (id, currentDescription, currentMonthlyValue, currentTotalMonths) => {
+            const userDocRef = getUserDocRef();
+            if (!userDocRef) return;
+
+            const newDesc = prompt(`Editar Descrição (${currentDescription}):`, currentDescription);
+            if (newDesc === null) return; // Cancelado
+
+            const newMonthlyValueStr = prompt(`Editar Valor Mensal (R$ ${currentMonthlyValue.toFixed(2)}):`, currentMonthlyValue.toFixed(2));
+            if (newMonthlyValueStr === null) return; // Cancelado
+
+            const newMonthlyValue = parseFloat(newMonthlyValueStr.replace(',', '.'));
+            
+            if (isNaN(newMonthlyValue) || newMonthlyValue <= 0) {
+                 console.error("Valor mensal inválido.");
+                 return;
+            }
+            
+            const newTotalMonthsStr = prompt(`Editar Total de Meses (Atual: ${currentTotalMonths}):`, currentTotalMonths);
+            if (newTotalMonthsStr === null) return; // Cancelado
+
+            const newTotalMonths = parseInt(newTotalMonthsStr, 10);
+
+            if (isNaN(newTotalMonths) || newTotalMonths <= 0) {
+                 console.error("Número de meses inválido.");
+                 return;
+            }
+
+
+            try {
+                const docRef = doc(collection(userDocRef, 'installments'), id);
+                await updateDoc(docRef, {
+                    description: newDesc.trim(),
+                    monthlyValue: newMonthlyValue,
+                    totalMonths: newTotalMonths
+                });
+            } catch (error) {
+                console.error("Erro ao editar parcela:", error);
+            }
+        };
+
+        // Exposta globalmente para uso no HTML
+        window.deleteTransaction = async (id) => {
+            const userDocRef = getUserDocRef();
+            if (!userDocRef) return;
+            try {
+                // Deletar documento na sub-coleção 'transactions'
+                const docRef = doc(collection(userDocRef, 'transactions'), id);
+                await deleteDoc(docRef);
+            } catch (error) {
+                console.error("Erro ao deletar transação:", error);
+            }
+        };
+
+        // Exposta globalmente para uso no HTML
+        window.deleteInstallment = async (id) => {
+            const userDocRef = getUserDocRef();
+            if (!userDocRef) return;
+            try {
+                // Deletar documento na sub-coleção 'installments'
+                const docRef = doc(collection(userDocRef, 'installments'), id);
+                await deleteDoc(docRef);
+            } catch (error) {
+                console.error("Erro ao deletar parcela:", error);
+            }
+        };
+
+        // --- Simulação de Open Finance (Chama o Backend) ---
+        window.importExtratoSimulado = async () => {
+            const importButton = document.getElementById('importButton');
+            if (!userId) return console.error("Usuário não autenticado para importar dados.");
+
+            const originalText = importButton.textContent;
+            importButton.textContent = 'Importando...';
+            importButton.disabled = true;
+
+            try {
+                const response = await fetch('http://127.0.0.1:5000/import-data', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ userId: userId })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Erro de HTTP: ${response.status}`);
+                }
+
+                const result = await response.json();
+                
+                if (result.status === 'success' && result.transactions) {
+                    const userDocRef = getUserDocRef();
+                    const transCollectionRef = collection(userDocRef, 'transactions');
+                    
+                    // Adicionar cada transação importada ao Firestore
+                    for (const t of result.transactions) {
+                        // Garante que o ID do Firestore seja gerado automaticamente
+                        await addDoc(transCollectionRef, t);
+                    }
+                    console.log(result.message);
+                    alert(`Importação concluída! ${result.transactions.length} transações adicionadas.`); // Usando alert apenas para feedback de sucesso
+                } else {
+                    alert(`Erro na importação: ${result.message || 'Resposta inválida do servidor.'}`);
+                }
+
+            } catch (error) {
+                console.error("Erro ao importar dados do backend:", error);
+                alert(`Falha ao conectar/importar do backend (Open Finance Simulado). Certifique-se de que 'backend.py' está em execução em http://127.0.0.1:5000/`);
+            } finally {
+                importButton.textContent = originalText;
+                importButton.disabled = false;
+            }
+        };
+
+        document.getElementById('transactionForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const userDocRef = getUserDocRef();
+            if (!userDocRef) {
+                console.error("Usuário não autenticado ou DB não inicializado.");
+                return;
+            }
+
+            const description = document.getElementById('descricaoTransacao').value.trim();
+            const amount = parseFloat(document.getElementById('valorTransacao').value);
+            const type = document.getElementById('tipoTransacao').value;
+
+            if (description && !isNaN(amount) && amount > 0) {
+                const newTransaction = {
+                    description,
+                    amount,
+                    type,
+                    date: new Date().toISOString().split('T')[0] // Formato YYYY-MM-DD
+                };
+                
+                try {
+                    // Adicionar documento na sub-coleção 'transactions'
+                    const collectionRef = collection(userDocRef, 'transactions');
+                    await addDoc(collectionRef, newTransaction);
+                    e.target.reset(); // Limpa o formulário
+                } catch (error) {
+                    console.error("Erro ao adicionar transação:", error);
+                }
+            } else {
+                console.error("Dados da transação inválidos.");
+            }
+        });
+
+        document.getElementById('installmentForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const userDocRef = getUserDocRef();
+            if (!userDocRef) {
+                console.error("Usuário não autenticado ou DB não inicializado.");
+                return;
+            }
+
+            const description = document.getElementById('descricaoParcela').value.trim();
+            const monthlyValue = parseFloat(document.getElementById('valorMensalParcela').value);
+            const totalMonths = parseInt(document.getElementById('totalMesesParcela').value, 10);
+
+            if (description && !isNaN(monthlyValue) && monthlyValue > 0 && totalMonths > 0) {
+                const newInstallment = {
+                    description,
+                    monthlyValue,
+                    totalMonths,
+                    date: new Date().toISOString().split('T')[0]
+                };
+
+                try {
+                    // Adicionar documento na sub-coleção 'installments'
+                    const collectionRef = collection(userDocRef, 'installments');
+                    await addDoc(collectionRef, newInstallment);
+                    e.target.reset(); // Limpa o formulário
+                } catch (error) {
+                    console.error("Erro ao adicionar parcela:", error);
+                }
+            } else {
+                console.error("Dados da parcela inválidos.");
+            }
+        });
+
+        // --- Funções de Navegação e Inicialização ---
+
+        window.showTab = (tabName) => {
+            // Remove active classes from all buttons and hides all contents
+            document.querySelectorAll('.tab-button').forEach(btn => {
+                btn.classList.remove('border-indigo-500', 'text-indigo-600');
+                btn.classList.add('border-transparent', 'text-gray-500');
+            });
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.add('hidden');
+            });
+
+            // Add active classes to the selected button and shows content
+            const activeBtn = document.getElementById(`tab${tabName.charAt(0).toUpperCase() + tabName.slice(1)}`);
+            const activeContent = document.getElementById(`content${tabName.charAt(0).toUpperCase() + tabName.slice(1)}`);
+            
+            if (activeBtn && activeContent) {
+                activeBtn.classList.remove('border-transparent', 'text-gray-500');
+                activeBtn.classList.add('border-indigo-500', 'text-indigo-600');
+                activeContent.classList.remove('hidden');
+            }
+        };
+
+        const updateAll = () => {
+            updateDashboard();
+            renderTransactions();
+            renderInstallments();
+        };
+
+    </script>
+
+</body>
+</html>
