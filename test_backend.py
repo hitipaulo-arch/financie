@@ -49,11 +49,16 @@ class TestHealth:
 
 class TestTransactions:
     def test_list_empty_transactions(self, client):
-        """Testa listagem vazia inicial."""
+        """Testa listagem vazia inicial (com paginação)."""
         response = client.get('/api/users/test_user/transactions')
         assert response.status_code == 200
         data = response.get_json()
-        assert data == []
+        # Estrutura paginada
+        assert 'items' in data
+        assert 'pagination' in data
+        assert data['items'] == []
+        assert data['pagination']['total'] == 0
+        assert data['pagination']['pages'] == 0
 
     def test_create_transaction(self, client):
         """Testa criação de transação."""
@@ -120,9 +125,11 @@ class TestTransactions:
         response = client.delete(f'/api/users/test_user/transactions/{txn_id}')
         assert response.status_code == 200
         
-        # Verificar que foi deletado
+        # Verificar que foi deletado (com paginação)
         list_resp = client.get('/api/users/test_user/transactions')
-        assert len(list_resp.get_json()) == 0
+        data = list_resp.get_json()
+        assert len(data['items']) == 0
+        assert data['pagination']['total'] == 0
 
     def test_delete_nonexistent_transaction(self, client):
         """Testa deletar transação inexistente."""
@@ -132,10 +139,14 @@ class TestTransactions:
 
 class TestInstallments:
     def test_list_empty_installments(self, client):
-        """Testa listagem vazia de parcelas."""
+        """Testa listagem vazia de parcelas (com paginação)."""
         response = client.get('/api/users/test_user/installments')
         assert response.status_code == 200
-        assert response.get_json() == []
+        data = response.get_json()
+        assert 'items' in data
+        assert 'pagination' in data
+        assert data['items'] == []
+        assert data['pagination']['total'] == 0
 
     def test_create_installment(self, client):
         """Testa criação de parcela."""
@@ -219,9 +230,11 @@ class TestImport:
         assert data['imported'] == 3
         assert len(data['transactions']) == 3
         
-        # Verificar que foram criadas
+        # Verificar que foram criadas (com paginação)
         list_resp = client.get('/api/users/test_user/transactions')
-        assert len(list_resp.get_json()) == 3
+        list_data = list_resp.get_json()
+        assert len(list_data['items']) == 3
+        assert list_data['pagination']['total'] == 3
 
 
 class TestOpenFinanceSync:
@@ -237,9 +250,11 @@ class TestOpenFinanceSync:
         assert data['source'] == 'open_finance_simulated'
         assert data['imported'] == 3
         assert len(data['transactions']) == 3
-        # Verifica persistência
+        # Verifica persistência (com paginação)
         list_resp = client.get('/api/users/test_user/transactions')
-        assert len(list_resp.get_json()) == 3  # não duplica além das importadas
+        list_data = list_resp.get_json()
+        assert len(list_data['items']) == 3  # não duplica além das importadas
+        assert list_data['pagination']['total'] == 3
 
     def test_open_finance_sync_dedup(self, client):
         """Segunda sincronização não deve duplicar transações."""
@@ -254,7 +269,9 @@ class TestOpenFinanceSync:
         assert data2['imported'] == 0
         assert data2['skipped_duplicates'] == 3
         list_resp = client.get('/api/users/test_user/transactions')
-        assert len(list_resp.get_json()) == 3
+        list_data = list_resp.get_json()
+        assert len(list_data['items']) == 3
+        assert list_data['pagination']['total'] == 3
 
     def test_open_finance_sync_without_consent(self, client):
         """Sync sem consent deve falhar."""
@@ -275,11 +292,80 @@ class TestMultiUser:
         client.post('/api/users/user2/transactions',
                    json={"description": "User2 Txn", "amount": 200, "type": "income"})
         
-        # Verificar isolamento
+        # Verificar isolamento (com paginação)
         user1_resp = client.get('/api/users/user1/transactions')
         user2_resp = client.get('/api/users/user2/transactions')
         
-        assert len(user1_resp.get_json()) == 1
-        assert len(user2_resp.get_json()) == 1
-        assert user1_resp.get_json()[0]['amount'] == 100
-        assert user2_resp.get_json()[0]['amount'] == 200
+        user1_data = user1_resp.get_json()
+        user2_data = user2_resp.get_json()
+        
+        assert len(user1_data['items']) == 1
+        assert len(user2_data['items']) == 1
+        assert user1_data['items'][0]['amount'] == 100
+        assert user2_data['items'][0]['amount'] == 200
+
+
+class TestPagination:
+    """Testes de paginação dos endpoints GET."""
+    
+    def test_pagination_default(self, client):
+        """Testa paginação com parâmetros padrão."""
+        # Criar 5 transações
+        for i in range(5):
+            client.post('/api/users/test_user/transactions',
+                       json={"description": f"Txn {i}", "amount": 100 + i, "type": "income"})
+        
+        # Requisitar sem parâmetros (deve retornar página 1, 20 itens por padrão)
+        response = client.get('/api/users/test_user/transactions')
+        data = response.get_json()
+        
+        assert data['pagination']['current_page'] == 1
+        assert data['pagination']['per_page'] == 20
+        assert data['pagination']['total'] == 5
+        assert data['pagination']['pages'] == 1
+        assert len(data['items']) == 5
+    
+    def test_pagination_with_params(self, client):
+        """Testa paginação com query params."""
+        # Criar 25 transações
+        for i in range(25):
+            client.post('/api/users/test_user/transactions',
+                       json={"description": f"Txn {i}", "amount": 100, "type": "income"})
+        
+        # Página 1, 10 itens por página
+        response = client.get('/api/users/test_user/transactions?page=1&per_page=10')
+        data = response.get_json()
+        
+        assert data['pagination']['current_page'] == 1
+        assert data['pagination']['per_page'] == 10
+        assert data['pagination']['total'] == 25
+        assert data['pagination']['pages'] == 3
+        assert len(data['items']) == 10
+        
+        # Página 2
+        response = client.get('/api/users/test_user/transactions?page=2&per_page=10')
+        data = response.get_json()
+        
+        assert data['pagination']['current_page'] == 2
+        assert len(data['items']) == 10
+        
+        # Página 3 (última, com 5 itens)
+        response = client.get('/api/users/test_user/transactions?page=3&per_page=10')
+        data = response.get_json()
+        
+        assert data['pagination']['current_page'] == 3
+        assert len(data['items']) == 5
+    
+    def test_pagination_max_per_page(self, client):
+        """Testa limite máximo de itens por página (100)."""
+        # Criar 150 transações
+        for i in range(150):
+            client.post('/api/users/test_user/transactions',
+                       json={"description": f"Txn {i}", "amount": 100, "type": "income"})
+        
+        # Solicitar per_page=1000 (deve ser limitado a 100)
+        response = client.get('/api/users/test_user/transactions?per_page=1000')
+        data = response.get_json()
+        
+        assert data['pagination']['per_page'] == 100  # Limitado a 100
+        assert len(data['items']) == 100

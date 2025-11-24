@@ -185,6 +185,47 @@ def create_app() -> Flask:
     def today_date() -> date:
         return date.today()
 
+    def paginate_query(query, page: int = 1, per_page: int = 20):
+        """
+        Pagina resultado de query SQLAlchemy.
+        
+        Args:
+            query: Query SQLAlchemy
+            page: Número da página (1-indexed)
+            per_page: Itens por página (máx 100)
+        
+        Returns:
+            {
+                "items": [...],
+                "total": 150,
+                "pages": 8,
+                "current_page": 1,
+                "per_page": 20
+            }
+        """
+        # Validar e limitar per_page
+        try:
+            page = max(1, int(page))
+            per_page = max(1, min(100, int(per_page)))  # Max 100 itens por página
+        except (ValueError, TypeError):
+            page = 1
+            per_page = 20
+        
+        # Executar query e contar total
+        items = query.offset((page - 1) * per_page).limit(per_page).all()
+        total = query.count()
+        
+        # Calcular total de páginas
+        pages = (total + per_page - 1) // per_page
+        
+        return {
+            "items": items,
+            "total": total,
+            "pages": pages,
+            "current_page": page,
+            "per_page": per_page
+        }
+
     def require_auth(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
@@ -338,8 +379,25 @@ def create_app() -> Flask:
     @csrf.exempt  # GET não requer CSRF
     def list_consents(user_id: str):
         session_db = get_session()
-        consents = session_db.query(Consent).filter(Consent.user_id == user_id).order_by(Consent.created_at.desc()).all()
-        return jsonify(consents_schema.dump(consents))
+        query = session_db.query(Consent).filter(Consent.user_id == user_id).order_by(Consent.created_at.desc())
+        
+        # Parâmetros de paginação
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 20, type=int)
+        
+        # Paginar
+        paginated = paginate_query(query, page, per_page)
+        
+        # Retornar com metadados de paginação
+        return jsonify({
+            "items": consents_schema.dump(paginated["items"]),
+            "pagination": {
+                "current_page": paginated["current_page"],
+                "per_page": paginated["per_page"],
+                "total": paginated["total"],
+                "pages": paginated["pages"]
+            }
+        })
 
     # -------------------------------------------------------------------
     # Transactions CRUD
@@ -348,9 +406,27 @@ def create_app() -> Flask:
     @require_auth
     @csrf.exempt  # GET não requer CSRF
     def list_transactions(user_id: str):
+        # Query base
         session = get_session()
-        items = session.query(Transaction).filter(Transaction.user_id == user_id).order_by(Transaction.date.desc()).all()
-        return jsonify(transactions_schema.dump(items))
+        query = session.query(Transaction).filter(Transaction.user_id == user_id).order_by(Transaction.date.desc())
+        
+        # Parâmetros de paginação
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 20, type=int)
+        
+        # Paginar
+        paginated = paginate_query(query, page, per_page)
+        
+        # Retornar com metadados de paginação
+        return jsonify({
+            "items": transactions_schema.dump(paginated["items"]),
+            "pagination": {
+                "current_page": paginated["current_page"],
+                "per_page": paginated["per_page"],
+                "total": paginated["total"],
+                "pages": paginated["pages"]
+            }
+        })
 
     @app.route("/api/users/<user_id>/transactions", methods=["POST"])
     @require_auth
@@ -428,8 +504,25 @@ def create_app() -> Flask:
     @csrf.exempt  # GET não requer CSRF
     def list_installments(user_id: str):
         session = get_session()
-        items = session.query(Installment).filter(Installment.user_id == user_id).order_by(Installment.date_added.desc()).all()
-        return jsonify(installments_schema.dump(items))
+        query = session.query(Installment).filter(Installment.user_id == user_id).order_by(Installment.date_added.desc())
+        
+        # Parâmetros de paginação
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 20, type=int)
+        
+        # Paginar
+        paginated = paginate_query(query, page, per_page)
+        
+        # Retornar com metadados de paginação
+        return jsonify({
+            "items": installments_schema.dump(paginated["items"]),
+            "pagination": {
+                "current_page": paginated["current_page"],
+                "per_page": paginated["per_page"],
+                "total": paginated["total"],
+                "pages": paginated["pages"]
+            }
+        })
 
     @app.route("/api/users/<user_id>/installments", methods=["POST"])
     @require_auth
