@@ -20,6 +20,9 @@ import time
 
 from flask import Flask, jsonify, request, redirect, url_for, session
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_wtf.csrf import CSRFProtect
 from sqlalchemy import create_engine, Integer, String, Float, Date, Column, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 from marshmallow import Schema, fields, ValidationError, validate
@@ -119,6 +122,17 @@ def create_app() -> Flask:
     # CORS com suporte a credenciais
     CORS(app, supports_credentials=True, origins=["http://localhost:5000", "http://127.0.0.1:5000"])
 
+    # Rate Limiting (CRITICAL: Previne brute force e DDoS)
+    limiter = Limiter(
+        app=app,
+        key_func=get_remote_address,
+        default_limits=["200 per day", "50 per hour"],
+        storage_uri="memory://"
+    )
+    
+    # CSRF Protection (CRITICAL: Previne Cross-Site Request Forgery)
+    csrf = CSRFProtect(app)
+
     # Configuração de cookies/sessão (controlada por .env)
     app.config.update(
         SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true",
@@ -130,6 +144,12 @@ def create_app() -> Flask:
     @app.before_request
     def _permanent_session():
         session.permanent = True
+
+    # Endpoint para obter CSRF token (para chamadas AJAX)
+    @app.route('/api/csrf-token', methods=['GET'])
+    def get_csrf_token():
+        """Retorna CSRF token para cliente usar em requisições POST/PUT/DELETE."""
+        return jsonify({"csrf_token": session.get('_csrf_token', 'N/A')}), 200
 
     # Cria tabelas se não existirem
     Base.metadata.create_all(engine)
@@ -213,11 +233,13 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/health")
     @require_auth
+    @csrf.exempt  # GET não requer CSRF
     def health():
         return jsonify({"status": "ok"})
 
     @app.route("/")
     @require_auth
+    @csrf.exempt  # GET não requer CSRF
     def root():
         return jsonify({"message": "Gestor Financeiro API", "health": "/api/health"}), 200
 
@@ -225,6 +247,7 @@ def create_app() -> Flask:
     # Autenticação Google OAuth
     # -------------------------------------------------------------------
     @app.route("/auth/login")
+    @limiter.limit("5 per minute")  # CRITICAL: Protege contra brute force
     def login():
         """Inicia fluxo de login com Google."""
         logger.info("Login iniciado", extra={"endpoint": "/auth/login", "method": "GET"})
@@ -284,6 +307,7 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/openfinance/consents", methods=["POST"])
     @require_auth
+    @limiter.limit("20 per hour")  # IMPORTANT: Limita criação de consents
     def create_consent(user_id: str):
         payload = request.get_json(silent=True) or {}
         if not payload.get('consent_id'):
@@ -311,6 +335,7 @@ def create_app() -> Flask:
 
     @app.route("/api/users/<user_id>/openfinance/consents", methods=["GET"])
     @require_auth
+    @csrf.exempt  # GET não requer CSRF
     def list_consents(user_id: str):
         session_db = get_session()
         consents = session_db.query(Consent).filter(Consent.user_id == user_id).order_by(Consent.created_at.desc()).all()
@@ -321,6 +346,7 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/transactions", methods=["GET"])
     @require_auth
+    @csrf.exempt  # GET não requer CSRF
     def list_transactions(user_id: str):
         session = get_session()
         items = session.query(Transaction).filter(Transaction.user_id == user_id).order_by(Transaction.date.desc()).all()
@@ -328,6 +354,7 @@ def create_app() -> Flask:
 
     @app.route("/api/users/<user_id>/transactions", methods=["POST"])
     @require_auth
+    @limiter.limit("100 per hour")  # IMPORTANT: Limita criação de transações
     def create_transaction(user_id: str):
         payload = request.get_json(silent=True) or {}
         payload["user_id"] = user_id
@@ -349,6 +376,7 @@ def create_app() -> Flask:
 
     @app.route("/api/users/<user_id>/transactions/<int:txn_id>", methods=["PUT", "PATCH"])
     @require_auth
+    @limiter.limit("100 per hour")  # IMPORTANT: Limita atualizações
     def update_transaction(user_id: str, txn_id: int):
         payload = request.get_json(silent=True) or {}
         session = get_session()
@@ -382,6 +410,7 @@ def create_app() -> Flask:
 
     @app.route("/api/users/<user_id>/transactions/<int:txn_id>", methods=["DELETE"])
     @require_auth
+    @limiter.limit("100 per hour")  # IMPORTANT: Limita exclusões
     def delete_transaction(user_id: str, txn_id: int):
         session = get_session()
         txn = session.query(Transaction).filter(Transaction.id == txn_id, Transaction.user_id == user_id).first()
@@ -396,6 +425,7 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/installments", methods=["GET"])
     @require_auth
+    @csrf.exempt  # GET não requer CSRF
     def list_installments(user_id: str):
         session = get_session()
         items = session.query(Installment).filter(Installment.user_id == user_id).order_by(Installment.date_added.desc()).all()
@@ -403,6 +433,7 @@ def create_app() -> Flask:
 
     @app.route("/api/users/<user_id>/installments", methods=["POST"])
     @require_auth
+    @limiter.limit("100 per hour")  # IMPORTANT: Limita criação de parcelas
     def create_installment(user_id: str):
         payload = request.get_json(silent=True) or {}
         payload["user_id"] = user_id
@@ -417,6 +448,7 @@ def create_app() -> Flask:
 
     @app.route("/api/users/<user_id>/installments/<int:inst_id>", methods=["PUT", "PATCH"])
     @require_auth
+    @limiter.limit("100 per hour")  # IMPORTANT: Limita atualizações de parcelas
     def update_installment(user_id: str, inst_id: int):
         payload = request.get_json(silent=True) or {}
         session = get_session()
@@ -453,6 +485,7 @@ def create_app() -> Flask:
 
     @app.route("/api/users/<user_id>/installments/<int:inst_id>", methods=["DELETE"])
     @require_auth
+    @limiter.limit("100 per hour")  # IMPORTANT: Limita exclusões de parcelas
     def delete_installment(user_id: str, inst_id: int):
         session = get_session()
         inst = session.query(Installment).filter(Installment.id == inst_id, Installment.user_id == user_id).first()
@@ -467,6 +500,7 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/summary", methods=["GET"])
     @require_auth
+    @csrf.exempt  # GET não requer CSRF
     def summary(user_id: str):
         session = get_session()
         txns = session.query(Transaction).filter(Transaction.user_id == user_id).all()
@@ -496,6 +530,7 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/import", methods=["POST"])
     @require_auth
+    @limiter.limit("20 per hour")  # IMPORTANT: Limita importações
     def import_data(user_id: str):
         session = get_session()
         hoje_str = today_date().isoformat()
@@ -522,6 +557,7 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/openfinance/sync", methods=["POST"])
     @require_auth
+    @limiter.limit("10 per hour")  # IMPORTANT: Limita sync para economizar banda
     def open_finance_sync(user_id: str):
         """Sincroniza transações via Open Finance (simulado)."""
         start_time = time.time()

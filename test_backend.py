@@ -13,6 +13,7 @@ def app():
     os.environ["GF_DB_URL"] = "sqlite:///:memory:"
     app = create_app()
     app.config['TESTING'] = True
+    app.config['WTF_CSRF_ENABLED'] = False  # Desabilitar CSRF em testes
     
     with app.app_context():
         Base.metadata.create_all(engine)
