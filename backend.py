@@ -11,21 +11,23 @@ Persistência: SQLite via SQLAlchemy.
 Serialização/validação: Marshmallow.
 """
 
-from datetime import datetime, date
+from datetime import datetime, date, UTC
 from typing import Optional
 import secrets
 from functools import wraps
 from datetime import timedelta
+import time
 
 from flask import Flask, jsonify, request, redirect, url_for, session
 from flask_cors import CORS
-from sqlalchemy import create_engine, Integer, String, Float, Date, Column
+from sqlalchemy import create_engine, Integer, String, Float, Date, Column, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 from marshmallow import Schema, fields, ValidationError, validate
 from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
 import os
-from open_finance import sync_user_transactions
+from providers import SimulatedProvider
+from logger import logger, LogContext
 
 load_dotenv()
 
@@ -62,6 +64,27 @@ class Installment(Base):
     date_added = Column(Date, nullable=False)
 
 
+class Consent(Base):
+    __tablename__ = "consents"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    consent_id = Column(String(128), unique=True, nullable=False)
+    provider = Column(String(64), nullable=False)
+    scopes = Column(String(512), nullable=False)
+    status = Column(String(32), nullable=False)  # active | revoked | expired
+    created_at = Column(DateTime, nullable=False)
+
+
+class ConsentSchema(Schema):
+    id = fields.Int(dump_only=True)
+    user_id = fields.Str(required=True, validate=validate.Length(min=1))
+    consent_id = fields.Str(required=True, validate=validate.Length(min=4))
+    provider = fields.Str(required=True, validate=validate.Length(min=2))
+    scopes = fields.Str(required=True)
+    status = fields.Str(required=True, validate=validate.OneOf(["active", "revoked", "expired"]))
+    created_at = fields.DateTime(dump_only=True)
+
+
 class TransactionSchema(Schema):
     id = fields.Int(dump_only=True)
     user_id = fields.Str(required=True, validate=validate.Length(min=1))
@@ -84,6 +107,8 @@ transaction_schema = TransactionSchema()
 transactions_schema = TransactionSchema(many=True)
 installment_schema = InstallmentSchema()
 installments_schema = InstallmentSchema(many=True)
+consent_schema = ConsentSchema()
+consents_schema = ConsentSchema(many=True)
 
 
 def create_app() -> Flask:
@@ -121,6 +146,9 @@ def create_app() -> Flask:
         )
     else:
         google = None
+
+    # Inicializa provider Open Finance (simulado). Em produção, instanciar provider real.
+    provider = SimulatedProvider()
 
     # -------------------------------------------------------------------
     # Utilitários
@@ -165,16 +193,16 @@ def create_app() -> Flask:
             self.message = message
 
     @app.errorhandler(BadRequest)
-    def handle_bad_request(e: BadRequest):
+    def handle_bad_request(e: BadRequest) -> tuple:
         return jsonify({"error": "bad_request", "details": e.messages}), 400
 
     @app.errorhandler(NotFound)
-    def handle_not_found(e: NotFound):
+    def handle_not_found(e: NotFound) -> tuple:
         return jsonify({"error": "not_found", "details": e.message}), 404
 
     from werkzeug.exceptions import HTTPException
     @app.errorhandler(Exception)
-    def handle_generic(e: Exception):
+    def handle_generic(e: Exception) -> tuple:
         # Evita transformar 404/405 etc em 500
         if isinstance(e, HTTPException):
             return jsonify({"error": e.name.lower().replace(' ', '_'), "details": e.description}), e.code
@@ -199,7 +227,9 @@ def create_app() -> Flask:
     @app.route("/auth/login")
     def login():
         """Inicia fluxo de login com Google."""
+        logger.info("Login iniciado", extra={"endpoint": "/auth/login", "method": "GET"})
         if not google:
+            logger.error("OAuth não configurado", extra={"endpoint": "/auth/login", "error_code": "oauth_config_missing"})
             return jsonify({"error": "OAuth não configurado. Configure GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET."}), 500
         redirect_uri = url_for('auth_callback', _external=True)
         return google.authorize_redirect(redirect_uri)
@@ -208,27 +238,34 @@ def create_app() -> Flask:
     def auth_callback():
         """Callback do Google OAuth."""
         if not google:
+            logger.error("OAuth não configurado no callback", extra={"endpoint": "/auth/callback", "error_code": "oauth_config_missing"})
             return jsonify({"error": "OAuth não configurado"}), 500
         try:
             token = google.authorize_access_token()
             user_info = token.get('userinfo')
             if user_info:
+                user_id = user_info.get('sub')
                 session['user'] = {
-                    'id': user_info.get('sub'),
+                    'id': user_id,
                     'email': user_info.get('email'),
                     'name': user_info.get('name'),
                     'picture': user_info.get('picture')
                 }
+                logger.info("Login bem-sucedido", extra={"user_id": user_id, "endpoint": "/auth/callback", "method": "GET"})
                 # Redirecionar para frontend
                 return redirect('http://localhost:5000/index_api.html?logged=true')
+            logger.warning("Informações de usuário não obtidas", extra={"endpoint": "/auth/callback", "error_code": "no_user_info"})
             return jsonify({"error": "Falha ao obter informações do usuário"}), 400
         except Exception as e:
+            logger.error("Erro no callback OAuth", extra={"endpoint": "/auth/callback", "error_code": "oauth_error", "exception": str(e)})
             return jsonify({"error": str(e)}), 400
 
     @app.route("/auth/logout")
     def logout():
         """Encerra sessão do usuário."""
+        user_id = session.get('user', {}).get('id')
         session.pop('user', None)
+        logger.info("Logout realizado", extra={"user_id": user_id, "endpoint": "/auth/logout", "method": "GET"})
         return jsonify({"message": "Logout realizado"}), 200
 
     @app.route("/auth/me")
@@ -241,6 +278,43 @@ def create_app() -> Flask:
             out['user_id'] = out.get('id')
             return jsonify(out), 200
         return jsonify({"error": "Não autenticado"}), 401
+
+    # -------------------------------------------------------------------
+    # Consents Open Finance (simulado)
+    # -------------------------------------------------------------------
+    @app.route("/api/users/<user_id>/openfinance/consents", methods=["POST"])
+    @require_auth
+    def create_consent(user_id: str):
+        payload = request.get_json(silent=True) or {}
+        if not payload.get('consent_id'):
+            payload['consent_id'] = secrets.token_hex(8)
+        if not payload.get('provider'):
+            payload['provider'] = 'simulated'
+        if not payload.get('scopes'):
+            payload['scopes'] = 'accounts:read transactions:read'
+        if not payload.get('status'):
+            payload['status'] = 'active'
+        payload['user_id'] = user_id
+        data = consent_schema.load(payload)
+        session_db = get_session()
+        obj = Consent(
+            user_id=payload.get('user_id', ''),
+            consent_id=payload.get('consent_id', ''),
+            provider=payload.get('provider', ''),
+            scopes=payload.get('scopes', ''),
+            status=payload.get('status', ''),
+            created_at=datetime.now(UTC)
+        )
+        session_db.add(obj)
+        session_db.commit()
+        return jsonify(consent_schema.dump(obj)), 201
+
+    @app.route("/api/users/<user_id>/openfinance/consents", methods=["GET"])
+    @require_auth
+    def list_consents(user_id: str):
+        session_db = get_session()
+        consents = session_db.query(Consent).filter(Consent.user_id == user_id).order_by(Consent.created_at.desc()).all()
+        return jsonify(consents_schema.dump(consents))
 
     # -------------------------------------------------------------------
     # Transactions CRUD
@@ -261,7 +335,14 @@ def create_app() -> Flask:
             payload["date"] = today_date().isoformat()
         data = parse_json(transaction_schema, payload)
         session = get_session()
-        txn = Transaction(**data)
+        # Construir Transaction com campos explícitos
+        txn = Transaction(
+            user_id=payload.get('user_id'),
+            description=payload.get('description'),
+            amount=payload.get('amount'),
+            type=payload.get('type'),
+            date=datetime.strptime(payload.get('date', ''), '%Y-%m-%d').date() if payload.get('date') else today_date()
+        )
         session.add(txn)
         session.commit()
         return jsonify(transaction_schema.dump(txn)), 201
@@ -390,17 +471,24 @@ def create_app() -> Flask:
         session = get_session()
         txns = session.query(Transaction).filter(Transaction.user_id == user_id).all()
         insts = session.query(Installment).filter(Installment.user_id == user_id).all()
-        income = sum(t.amount for t in txns if t.type == "income")
-        expenses_avulsa = sum(t.amount for t in txns if t.type == "expense")
-        expenses_parcelas = sum(i.monthly_value for i in insts)
-        expenses_total = expenses_avulsa + expenses_parcelas
-        balance = income - expenses_total
+        # Calcular somas iterando sobre objetos ORM
+        income = 0.0
+        expenses_avulsa = 0.0
+        for t in txns:
+            amt = float(t.amount) if t.amount else 0.0
+            if t.type and t.type == "income":
+                income += amt
+            elif t.type and t.type == "expense":
+                expenses_avulsa += amt
+        expenses_parcelas = sum(float(i.monthly_value) if i.monthly_value else 0.0 for i in insts) if insts else 0.0
+        expenses_total = float(expenses_avulsa) + float(expenses_parcelas)
+        balance = float(income) - float(expenses_total)
         return jsonify({
-            "income": income,
-            "expenses_avulsa": expenses_avulsa,
-            "expenses_parcelas": expenses_parcelas,
-            "expenses_total": expenses_total,
-            "balance": balance
+            "income": round(income, 2),
+            "expenses_avulsa": round(expenses_avulsa, 2),
+            "expenses_parcelas": round(expenses_parcelas, 2),
+            "expenses_total": round(expenses_total, 2),
+            "balance": round(balance, 2)
         })
 
     # -------------------------------------------------------------------
@@ -436,8 +524,17 @@ def create_app() -> Flask:
     @require_auth
     def open_finance_sync(user_id: str):
         """Sincroniza transações via Open Finance (simulado)."""
+        start_time = time.time()
         session_db = get_session()
-        result = sync_user_transactions(local_user_id=user_id)
+        # Validar consent ativo
+        active_consent = session_db.query(Consent).filter(Consent.user_id == user_id, Consent.status == 'active').first()
+        if not active_consent:
+            logger.warning("Tentativa de sync sem consent ativo", extra={"user_id": user_id, "endpoint": "/openfinance/sync", "error_code": "no_active_consent"})
+            return jsonify({"error": "no_active_consent", "details": "Nenhum consent ativo encontrado para este usuário."}), 400
+        
+        logger.info("Sincronização Open Finance iniciada", extra={"user_id": user_id, "endpoint": "/openfinance/sync", "consent_id": active_consent.consent_id})
+        # Usa provider para sincronizar (abstração preparada para múltiplos provedores).
+        result = provider.sync(local_user_id=user_id)
         inserted = []
         skipped = 0
 
@@ -463,12 +560,15 @@ def create_app() -> Flask:
             inserted.append(obj)
             existing_fp.add(fp)
         session_db.commit()
+        duration_ms = (time.time() - start_time) * 1000
+        logger.info("Sincronização Open Finance concluída", extra={"user_id": user_id, "endpoint": "/openfinance/sync", "imported": len(inserted), "skipped": skipped, "duration_ms": round(duration_ms, 2)})
         return jsonify({
             "status": "success",
             "source": result.get("source"),
             "imported": len(inserted),
             "skipped_duplicates": skipped,
-            "transactions": transactions_schema.dump(inserted)
+            "transactions": transactions_schema.dump(inserted),
+            "consent_id": active_consent.consent_id
         }), 201
 
     return app

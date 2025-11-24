@@ -226,6 +226,9 @@ class TestImport:
 class TestOpenFinanceSync:
     def test_open_finance_sync(self, client):
         """Testa sincronização simulada via Open Finance."""
+        # Criar consent primeiro
+        consent_resp = client.post('/api/users/test_user/openfinance/consents', json={})
+        assert consent_resp.status_code == 201
         response = client.post('/api/users/test_user/openfinance/sync')
         assert response.status_code == 201
         data = response.get_json()
@@ -239,6 +242,7 @@ class TestOpenFinanceSync:
 
     def test_open_finance_sync_dedup(self, client):
         """Segunda sincronização não deve duplicar transações."""
+        client.post('/api/users/test_user/openfinance/consents', json={})
         first = client.post('/api/users/test_user/openfinance/sync')
         assert first.status_code == 201
         data1 = first.get_json()
@@ -250,6 +254,13 @@ class TestOpenFinanceSync:
         assert data2['skipped_duplicates'] == 3
         list_resp = client.get('/api/users/test_user/transactions')
         assert len(list_resp.get_json()) == 3
+
+    def test_open_finance_sync_without_consent(self, client):
+        """Sync sem consent deve falhar."""
+        response = client.post('/api/users/test_user/openfinance/sync')
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data['error'] == 'no_active_consent'
 
 
 class TestMultiUser:

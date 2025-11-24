@@ -14,6 +14,7 @@ Aplicação para gestão de finanças pessoais com:
 | Frontend | `index_api.html` | Interface REST com sessão autenticada |
 | Importação Simulada | Endpoint `/api/users/<user_id>/import` | Gera transações fictícias (Open Finance) |
 | Open Finance Sync | Endpoint `/api/users/<user_id>/openfinance/sync` | Sincroniza transações via Open Finance (simulado) |
+| Provider Abstração | `providers.py` | Facilita troca de provedor (simulado → real) |
 
 ## Instalação
 No diretório `gestor-financeiro`:
@@ -73,7 +74,7 @@ pytest test_backend.py -v
 pytest test_backend.py -v --cov=backend --cov-report=term-missing
 ```
 
-**Resultado esperado:** 17 testes passando, cobertura ~85%.
+**Resultado esperado:** 20 testes passando, cobertura ~85%.
 
 ## Base de Dados
 SQLite criada automaticamente (`data.db`). Para redefinir: apagar o ficheiro antes de iniciar.
@@ -151,6 +152,44 @@ Todos os endpoints são namespaced por `user_id` (obtido via OAuth). Requer sess
   ]
 }
 ```
+
+### Consentimento Open Finance (Simulado)
+Antes de sincronizar é necessário um consentimento ativo do usuário.
+
+Endpoints:
+- `POST /api/users/<user_id>/openfinance/consents` cria consentimento (gera `consent_id` se omitido).
+- `GET /api/users/<user_id>/openfinance/consents` lista consentimentos (mais recente primeiro).
+
+Campos ao criar (POST):
+| Campo | Obrigatório | Default se omitido |
+|-------|-------------|--------------------|
+| `consent_id` | não | hash aleatório (token_hex) |
+| `provider` | não | `simulated` |
+| `scopes` | não | `accounts:read transactions:read` |
+| `status` | não | `active` |
+
+Fluxo para sync:
+1. Criar consent ativo.
+2. Chamar `POST /api/users/<user_id>/openfinance/sync`.
+3. Resposta inclui `consent_id` usado.
+
+Erro sem consentimento:
+```json
+{"error": "no_active_consent", "details": "Nenhum consent ativo encontrado para este usuário."}
+```
+
+### Deduplicação de Transações
+Durante a sincronização, transações já existentes são ignoradas usando uma "impressão digital" composta de:
+`date | type | amount | description(normalizada em minúsculas)`.
+
+Resposta da sync inclui campo `skipped_duplicates` com a quantidade ignorada.
+
+### Provider Abstração
+Arquivo `providers.py` define:
+- `BaseProvider` (interface mínima)
+- `SimulatedProvider` (retorna lista fixa)
+
+O endpoint de sync usa a abstração (`provider.sync(...)`). Para integrar um provedor real, criar nova classe implementando `fetch_transactions`.
 
 ## Exemplos `curl`
 ```bash
