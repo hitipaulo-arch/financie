@@ -369,3 +369,144 @@ class TestPagination:
         
         assert data['pagination']['per_page'] == 100  # Limitado a 100
         assert len(data['items']) == 100
+
+
+class TestSoftDelete:
+    """Testes de soft delete (exclusão lógica)."""
+    
+    def test_soft_delete_transaction(self, client):
+        """Testa que DELETE define deleted_at ao invés de remover fisicamente."""
+        # Criar transação
+        payload = {"description": "Para Soft Delete", "amount": 50, "type": "expense"}
+        create_resp = client.post('/api/users/test_user/transactions', json=payload)
+        txn_id = create_resp.get_json()['id']
+        
+        # Deletar (soft delete)
+        delete_resp = client.delete(f'/api/users/test_user/transactions/{txn_id}')
+        assert delete_resp.status_code == 200
+        
+        # Verificar que NÃO aparece na listagem (filtrado)
+        list_resp = client.get('/api/users/test_user/transactions')
+        data = list_resp.get_json()
+        assert len(data['items']) == 0
+        assert data['pagination']['total'] == 0
+    
+    def test_soft_delete_not_in_summary(self, client):
+        """Testa que registros soft-deleted não aparecem no summary."""
+        # Criar receita e despesa
+        client.post('/api/users/test_user/transactions',
+                   json={"description": "Receita", "amount": 1000, "type": "income"})
+        create_resp = client.post('/api/users/test_user/transactions',
+                                 json={"description": "Despesa", "amount": 500, "type": "expense"})
+        expense_id = create_resp.get_json()['id']
+        
+        # Verificar summary antes de deletar
+        summary_before = client.get('/api/users/test_user/summary')
+        data_before = summary_before.get_json()
+        assert data_before['income'] == 1000
+        assert data_before['expenses_avulsa'] == 500
+        assert data_before['balance'] == 500
+        
+        # Soft delete da despesa
+        client.delete(f'/api/users/test_user/transactions/{expense_id}')
+        
+        # Verificar que summary não inclui registro deletado
+        summary_after = client.get('/api/users/test_user/summary')
+        data_after = summary_after.get_json()
+        assert data_after['income'] == 1000
+        assert data_after['expenses_avulsa'] == 0  # Despesa foi soft-deleted
+        assert data_after['balance'] == 1000
+    
+    def test_soft_delete_installment(self, client):
+        """Testa soft delete de parcela."""
+        # Criar parcela
+        payload = {"description": "Parcela Teste", "monthly_value": 100, "total_months": 12}
+        create_resp = client.post('/api/users/test_user/installments', json=payload)
+        inst_id = create_resp.get_json()['id']
+        
+        # Deletar
+        delete_resp = client.delete(f'/api/users/test_user/installments/{inst_id}')
+        assert delete_resp.status_code == 200
+        
+        # Verificar que não aparece na listagem
+        list_resp = client.get('/api/users/test_user/installments')
+        data = list_resp.get_json()
+        assert len(data['items']) == 0
+        assert data['pagination']['total'] == 0
+    
+    def test_soft_delete_not_in_installment_summary(self, client):
+        """Testa que parcelas soft-deleted não aparecem no summary."""
+        # Criar parcela
+        create_resp = client.post('/api/users/test_user/installments',
+                                 json={"description": "Cartão", "monthly_value": 300, "total_months": 6})
+        inst_id = create_resp.get_json()['id']
+        
+        # Verificar summary antes
+        summary_before = client.get('/api/users/test_user/summary')
+        data_before = summary_before.get_json()
+        assert data_before['expenses_parcelas'] == 300
+        
+        # Soft delete
+        client.delete(f'/api/users/test_user/installments/{inst_id}')
+        
+        # Verificar que summary não inclui parcela deletada
+        summary_after = client.get('/api/users/test_user/summary')
+        data_after = summary_after.get_json()
+        assert data_after['expenses_parcelas'] == 0
+    
+    def test_cannot_update_soft_deleted_transaction(self, client):
+        """Testa que não é possível atualizar transação soft-deleted."""
+        # Criar e deletar transação
+        create_resp = client.post('/api/users/test_user/transactions',
+                                 json={"description": "Original", "amount": 100, "type": "income"})
+        txn_id = create_resp.get_json()['id']
+        client.delete(f'/api/users/test_user/transactions/{txn_id}')
+        
+        # Tentar atualizar (deve retornar 404)
+        update_resp = client.patch(f'/api/users/test_user/transactions/{txn_id}',
+                                   json={"description": "Tentativa Atualização"})
+        assert update_resp.status_code == 404
+    
+    def test_cannot_delete_already_soft_deleted(self, client):
+        """Testa que não é possível deletar novamente um registro já soft-deleted."""
+        # Criar e deletar transação
+        create_resp = client.post('/api/users/test_user/transactions',
+                                 json={"description": "Original", "amount": 100, "type": "income"})
+        txn_id = create_resp.get_json()['id']
+        client.delete(f'/api/users/test_user/transactions/{txn_id}')
+        
+        # Tentar deletar novamente (deve retornar 404)
+        delete_again_resp = client.delete(f'/api/users/test_user/transactions/{txn_id}')
+        assert delete_again_resp.status_code == 404
+    
+    def test_soft_delete_not_in_sync_dedup(self, client):
+        """Testa que transações soft-deleted não causam deduplicação em sync."""
+        # Criar consent
+        client.post('/api/users/test_user/openfinance/consents', json={})
+        
+        # Primeira sync
+        first_sync = client.post('/api/users/test_user/openfinance/sync')
+        assert first_sync.status_code == 201
+        data1 = first_sync.get_json()
+        assert data1['imported'] == 3
+        
+        # Listar transações
+        list_resp = client.get('/api/users/test_user/transactions')
+        transactions = list_resp.get_json()['items']
+        
+        # Soft delete todas as transações
+        for txn in transactions:
+            client.delete(f'/api/users/test_user/transactions/{txn["id"]}')
+        
+        # Segunda sync (deve importar novamente, pois as anteriores estão soft-deleted)
+        second_sync = client.post('/api/users/test_user/openfinance/sync')
+        assert second_sync.status_code == 201
+        data2 = second_sync.get_json()
+        assert data2['imported'] == 3  # Reimporta porque as antigas estão deletadas
+        assert data2['skipped_duplicates'] == 0
+        
+        # Verificar que apenas as novas aparecem na listagem
+        list_after = client.get('/api/users/test_user/transactions')
+        list_data = list_after.get_json()
+        assert len(list_data['items']) == 3
+        assert list_data['pagination']['total'] == 3

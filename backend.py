@@ -55,6 +55,7 @@ class Transaction(Base):
     amount = Column(Float, nullable=False)
     type = Column(String(16), nullable=False)  # income | expense
     date = Column(Date, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)  # Soft delete timestamp
 
 
 class Installment(Base):
@@ -65,6 +66,7 @@ class Installment(Base):
     monthly_value = Column(Float, nullable=False)
     total_months = Column(Integer, nullable=False)
     date_added = Column(Date, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)  # Soft delete timestamp
 
 
 class Consent(Base):
@@ -76,6 +78,7 @@ class Consent(Base):
     scopes = Column(String(512), nullable=False)
     status = Column(String(32), nullable=False)  # active | revoked | expired
     created_at = Column(DateTime, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)  # Soft delete timestamp
 
 
 class ConsentSchema(Schema):
@@ -379,7 +382,10 @@ def create_app() -> Flask:
     @csrf.exempt  # GET não requer CSRF
     def list_consents(user_id: str):
         session_db = get_session()
-        query = session_db.query(Consent).filter(Consent.user_id == user_id).order_by(Consent.created_at.desc())
+        query = session_db.query(Consent).filter(
+            Consent.user_id == user_id,
+            Consent.deleted_at.is_(None)
+        ).order_by(Consent.created_at.desc())
         
         # Parâmetros de paginação
         page = request.args.get('page', 1, type=int)
@@ -406,9 +412,12 @@ def create_app() -> Flask:
     @require_auth
     @csrf.exempt  # GET não requer CSRF
     def list_transactions(user_id: str):
-        # Query base
+        # Query base - filtrar apenas registros não deletados
         session = get_session()
-        query = session.query(Transaction).filter(Transaction.user_id == user_id).order_by(Transaction.date.desc())
+        query = session.query(Transaction).filter(
+            Transaction.user_id == user_id,
+            Transaction.deleted_at.is_(None)
+        ).order_by(Transaction.date.desc())
         
         # Parâmetros de paginação
         page = request.args.get('page', 1, type=int)
@@ -456,7 +465,11 @@ def create_app() -> Flask:
     def update_transaction(user_id: str, txn_id: int):
         payload = request.get_json(silent=True) or {}
         session = get_session()
-        txn: Optional[Transaction] = session.query(Transaction).filter(Transaction.id == txn_id, Transaction.user_id == user_id).first()
+        txn: Optional[Transaction] = session.query(Transaction).filter(
+            Transaction.id == txn_id,
+            Transaction.user_id == user_id,
+            Transaction.deleted_at.is_(None)
+        ).first()
         if not txn:
             raise NotFound("Transação não encontrada")
         # Campos permitidos
@@ -489,10 +502,15 @@ def create_app() -> Flask:
     @limiter.limit("100 per hour")  # IMPORTANT: Limita exclusões
     def delete_transaction(user_id: str, txn_id: int):
         session = get_session()
-        txn = session.query(Transaction).filter(Transaction.id == txn_id, Transaction.user_id == user_id).first()
+        txn = session.query(Transaction).filter(
+            Transaction.id == txn_id,
+            Transaction.user_id == user_id,
+            Transaction.deleted_at.is_(None)
+        ).first()
         if not txn:
             raise NotFound("Transação não encontrada")
-        session.delete(txn)
+        # Soft delete: set deleted_at timestamp
+        txn.deleted_at = datetime.now(UTC)
         session.commit()
         return jsonify({"deleted": txn_id})
 
@@ -504,7 +522,10 @@ def create_app() -> Flask:
     @csrf.exempt  # GET não requer CSRF
     def list_installments(user_id: str):
         session = get_session()
-        query = session.query(Installment).filter(Installment.user_id == user_id).order_by(Installment.date_added.desc())
+        query = session.query(Installment).filter(
+            Installment.user_id == user_id,
+            Installment.deleted_at.is_(None)
+        ).order_by(Installment.date_added.desc())
         
         # Parâmetros de paginação
         page = request.args.get('page', 1, type=int)
@@ -545,7 +566,11 @@ def create_app() -> Flask:
     def update_installment(user_id: str, inst_id: int):
         payload = request.get_json(silent=True) or {}
         session = get_session()
-        inst: Optional[Installment] = session.query(Installment).filter(Installment.id == inst_id, Installment.user_id == user_id).first()
+        inst: Optional[Installment] = session.query(Installment).filter(
+            Installment.id == inst_id,
+            Installment.user_id == user_id,
+            Installment.deleted_at.is_(None)
+        ).first()
         if not inst:
             raise NotFound("Parcela não encontrada")
         for field in ["description", "monthly_value", "total_months", "date_added"]:
@@ -581,10 +606,15 @@ def create_app() -> Flask:
     @limiter.limit("100 per hour")  # IMPORTANT: Limita exclusões de parcelas
     def delete_installment(user_id: str, inst_id: int):
         session = get_session()
-        inst = session.query(Installment).filter(Installment.id == inst_id, Installment.user_id == user_id).first()
+        inst = session.query(Installment).filter(
+            Installment.id == inst_id,
+            Installment.user_id == user_id,
+            Installment.deleted_at.is_(None)
+        ).first()
         if not inst:
             raise NotFound("Parcela não encontrada")
-        session.delete(inst)
+        # Soft delete: set deleted_at timestamp
+        inst.deleted_at = datetime.now(UTC)
         session.commit()
         return jsonify({"deleted": inst_id})
 
@@ -596,8 +626,15 @@ def create_app() -> Flask:
     @csrf.exempt  # GET não requer CSRF
     def summary(user_id: str):
         session = get_session()
-        txns = session.query(Transaction).filter(Transaction.user_id == user_id).all()
-        insts = session.query(Installment).filter(Installment.user_id == user_id).all()
+        # Filtrar apenas registros não deletados
+        txns = session.query(Transaction).filter(
+            Transaction.user_id == user_id,
+            Transaction.deleted_at.is_(None)
+        ).all()
+        insts = session.query(Installment).filter(
+            Installment.user_id == user_id,
+            Installment.deleted_at.is_(None)
+        ).all()
         # Calcular somas iterando sobre objetos ORM
         income = 0.0
         expenses_avulsa = 0.0
@@ -667,8 +704,11 @@ def create_app() -> Flask:
         inserted = []
         skipped = 0
 
-        # Pré-carrega transações existentes do usuário para deduplicação
-        existing = session_db.query(Transaction).filter(Transaction.user_id == user_id).all()
+        # Pré-carrega transações existentes do usuário para deduplicação (apenas não deletadas)
+        existing = session_db.query(Transaction).filter(
+            Transaction.user_id == user_id,
+            Transaction.deleted_at.is_(None)
+        ).all()
         def fingerprint(d: dict) -> str:
             return f"{d['date']}|{d['type']}|{d['amount']:.2f}|{d['description'].strip().lower()}"
         existing_fp = {fingerprint({
