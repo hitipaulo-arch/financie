@@ -236,6 +236,94 @@ class TestImport:
         assert len(list_data['items']) == 3
         assert list_data['pagination']['total'] == 3
 
+class TestWebhooks:
+    def test_webhook_consent_revoked(self, client):
+        """Testa webhook de consentimento revogado."""
+        # Criar consent
+        client.post('/api/users/test_user/openfinance/consents', json={})
+        
+        # Enviar webhook de revogação
+        webhook_payload = {
+            "event": "consent.revoked",
+            "consent_id": "simulated-consent-123",
+            "data": {}
+        }
+        response = client.post('/api/openfinance/webhook', json=webhook_payload)
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['status'] == 'processed'
+        assert data['event'] == 'consent.revoked'
+    
+    def test_webhook_consent_expired(self, client):
+        """Testa webhook de consentimento expirado."""
+        # Criar consent
+        client.post('/api/users/test_user/openfinance/consents', json={})
+        
+        # Enviar webhook de expiração
+        webhook_payload = {
+            "event": "consent.expired",
+            "consent_id": "simulated-consent-123",
+            "data": {}
+        }
+        response = client.post('/api/openfinance/webhook', json=webhook_payload)
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['status'] == 'processed'
+    
+    def test_webhook_transaction_created(self, client):
+        """Testa webhook de nova transação."""
+        # Criar consent
+        client.post('/api/users/test_user/openfinance/consents', json={})
+        
+        # Enviar webhook de nova transação
+        webhook_payload = {
+            "event": "transaction.created",
+            "consent_id": "simulated-consent-123",
+            "data": {"count": 5}
+        }
+        response = client.post('/api/openfinance/webhook', json=webhook_payload)
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['status'] == 'processed'
+    
+    def test_webhook_unknown_consent(self, client):
+        """Testa webhook para consent desconhecido."""
+        webhook_payload = {
+            "event": "consent.revoked",
+            "consent_id": "unknown-consent-999",
+            "data": {}
+        }
+        response = client.post('/api/openfinance/webhook', json=webhook_payload)
+        assert response.status_code == 404
+        data = response.get_json()
+        assert data['error'] == 'consent_not_found'
+    
+    def test_webhook_invalid_payload(self, client):
+        """Testa webhook com payload inválido."""
+        webhook_payload = {
+            "event": "consent.revoked"
+            # Falta consent_id
+        }
+        response = client.post('/api/openfinance/webhook', json=webhook_payload)
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data['error'] == 'missing_required_fields'
+    
+    def test_webhook_unknown_event(self, client):
+        """Testa webhook com evento desconhecido."""
+        # Criar consent
+        client.post('/api/users/test_user/openfinance/consents', json={})
+        
+        webhook_payload = {
+            "event": "unknown.event.type",
+            "consent_id": "simulated-consent-123",
+            "data": {}
+        }
+        response = client.post('/api/openfinance/webhook', json=webhook_payload)
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data['error'] == 'unknown_event_type'
+
 
 class TestOpenFinanceSync:
     def test_open_finance_sync(self, client):

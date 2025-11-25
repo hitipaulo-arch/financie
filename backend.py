@@ -23,7 +23,7 @@ from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect
-from sqlalchemy import create_engine, Integer, String, Float, Date, Column, DateTime
+from sqlalchemy import create_engine, Integer, String, Float, Date, Column, DateTime, Index
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 from marshmallow import Schema, fields, ValidationError, validate
 from authlib.integrations.flask_client import OAuth
@@ -49,6 +49,13 @@ Base = declarative_base()
 
 class Transaction(Base):
     __tablename__ = "transactions"
+    __table_args__ = (
+        Index('idx_transaction_date', 'date'),
+        Index('idx_transaction_type', 'type'),
+        Index('idx_transaction_deleted_at', 'deleted_at'),
+        Index('idx_transaction_user_date', 'user_id', 'date'),
+    )
+    
     id = Column(Integer, primary_key=True)
     user_id = Column(String(64), index=True, nullable=False)
     description = Column(String(255), nullable=False)
@@ -60,6 +67,12 @@ class Transaction(Base):
 
 class Installment(Base):
     __tablename__ = "installments"
+    __table_args__ = (
+        Index('idx_installment_date_added', 'date_added'),
+        Index('idx_installment_deleted_at', 'deleted_at'),
+        Index('idx_installment_user_date', 'user_id', 'date_added'),
+    )
+    
     id = Column(Integer, primary_key=True)
     user_id = Column(String(64), index=True, nullable=False)
     description = Column(String(255), nullable=False)
@@ -71,6 +84,12 @@ class Installment(Base):
 
 class Consent(Base):
     __tablename__ = "consents"
+    __table_args__ = (
+        Index('idx_consent_status', 'status'),
+        Index('idx_consent_deleted_at', 'deleted_at'),
+        Index('idx_consent_user_status', 'user_id', 'status'),
+    )
+    
     id = Column(Integer, primary_key=True)
     user_id = Column(String(64), index=True, nullable=False)
     consent_id = Column(String(128), unique=True, nullable=False)
@@ -770,6 +789,135 @@ def create_app() -> Flask:
             "transactions": transactions_schema.dump(inserted),
             "consent_id": active_consent.consent_id
         }), 201
+
+    @app.route("/api/openfinance/webhook", methods=["POST"])
+    @csrf.exempt  # Webhooks são chamados por serviços externos, não podem ter CSRF
+    @limiter.limit("100 per hour")
+    def openfinance_webhook():
+        """
+        Endpoint para receber webhooks do Open Finance.
+        
+        Eventos suportados:
+        - consent.revoked: Consentimento foi revogado pelo usuário
+        - consent.expired: Consentimento expirou
+        - transaction.created: Nova transação disponível
+        - account.updated: Dados da conta foram atualizados
+        """
+        start_time = time.time()
+        
+        # Validar assinatura do webhook (se configurado)
+        webhook_secret = os.getenv("OPENFINANCE_WEBHOOK_SECRET")
+        if webhook_secret:
+            signature = request.headers.get("X-Webhook-Signature")
+            if not signature:
+                logger.warning("Webhook sem assinatura recebido", extra={"endpoint": "/openfinance/webhook"})
+                return jsonify({"error": "missing_signature"}), 401
+            
+            # Verificar assinatura HMAC
+            import hmac
+            import hashlib
+            expected_signature = hmac.new(
+                webhook_secret.encode(),
+                request.get_data(),
+                hashlib.sha256
+            ).hexdigest()
+            
+            if not hmac.compare_digest(signature, expected_signature):
+                logger.warning("Webhook com assinatura inválida", extra={"endpoint": "/openfinance/webhook"})
+                return jsonify({"error": "invalid_signature"}), 401
+        
+        try:
+            payload = request.get_json()
+            if not payload:
+                return jsonify({"error": "invalid_payload"}), 400
+            
+            event_type = payload.get("event")
+            consent_id = payload.get("consent_id")
+            event_data = payload.get("data", {})
+            
+            if not event_type or not consent_id:
+                return jsonify({"error": "missing_required_fields"}), 400
+            
+            logger.info(f"Webhook recebido: {event_type}", extra={
+                "endpoint": "/openfinance/webhook",
+                "event": event_type,
+                "consent_id": consent_id
+            })
+            
+            # Usar sessão do banco
+            db = SessionLocal()
+            try:
+                # Buscar consentimento
+                consent = db.query(Consent).filter(
+                    Consent.consent_id == consent_id,
+                    Consent.deleted_at.is_(None)
+            ).first()
+            
+                if not consent:
+                    logger.warning("Webhook para consent desconhecido", extra={
+                        "consent_id": consent_id,
+                        "event": event_type
+                    })
+                    return jsonify({"error": "consent_not_found"}), 404
+                
+                # Processar evento
+                if event_type == "consent.revoked":
+                    consent.status = "revoked"
+                    db.commit()
+                    logger.info("Consentimento revogado via webhook", extra={
+                        "consent_id": consent_id,
+                        "user_id": consent.user_id
+                    })
+                    
+                elif event_type == "consent.expired":
+                    consent.status = "expired"
+                    db.commit()
+                    logger.info("Consentimento expirado via webhook", extra={
+                        "consent_id": consent_id,
+                        "user_id": consent.user_id
+                    })
+                    
+                elif event_type == "transaction.created":
+                    # Disparar sincronização automática em background (opcional)
+                    # Por enquanto, apenas logar o evento
+                    logger.info("Nova transação disponível", extra={
+                        "consent_id": consent_id,
+                        "user_id": consent.user_id,
+                        "transaction_count": event_data.get("count", 1)
+                    })
+                    # TODO: Implementar sincronização automática em background task
+                    
+                elif event_type == "account.updated":
+                    logger.info("Conta atualizada", extra={
+                        "consent_id": consent_id,
+                        "user_id": consent.user_id
+                    })
+                    # TODO: Atualizar informações da conta
+                    
+                else:
+                    logger.warning("Evento desconhecido", extra={
+                        "event": event_type,
+                        "consent_id": consent_id
+                    })
+                    return jsonify({"error": "unknown_event_type"}), 400
+                
+                duration_ms = (time.time() - start_time) * 1000
+                logger.info("Webhook processado com sucesso", extra={
+                    "endpoint": "/openfinance/webhook",
+                    "event": event_type,
+                    "duration_ms": round(duration_ms, 2)
+                })
+                
+                return jsonify({"status": "processed", "event": event_type}), 200
+            finally:
+                db.close()
+                
+        except Exception as e:
+            logger.error("Erro ao processar webhook", extra={
+                "endpoint": "/openfinance/webhook",
+                "error": str(e)
+            })
+            return jsonify({"error": "webhook_processing_failed", "details": str(e)}), 500
 
     return app
 
