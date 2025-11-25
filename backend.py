@@ -29,7 +29,7 @@ from marshmallow import Schema, fields, ValidationError, validate
 from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
 import os
-from providers import SimulatedProvider
+from providers import SimulatedProvider, OpenFinanceProvider
 from logger import logger, LogContext
 
 load_dotenv()
@@ -170,8 +170,22 @@ def create_app() -> Flask:
     else:
         google = None
 
-    # Inicializa provider Open Finance (simulado). Em produção, instanciar provider real.
-    provider = SimulatedProvider()
+    # Inicializa provider Open Finance
+    # Se credenciais reais configuradas, usa OpenFinanceProvider; senão, usa simulado
+    use_real_openfinance = os.getenv("OPENFINANCE_ENABLE_REAL", "false").lower() == "true"
+    
+    if use_real_openfinance:
+        provider = OpenFinanceProvider(
+            base_url=os.getenv("OPENFINANCE_BASE_URL"),
+            client_id=os.getenv("OPENFINANCE_CLIENT_ID"),
+            client_secret=os.getenv("OPENFINANCE_CLIENT_SECRET"),
+            certificate_path=os.getenv("OPENFINANCE_CERT_PATH"),
+            private_key_path=os.getenv("OPENFINANCE_KEY_PATH")
+        )
+        logger.info("Open Finance real provider inicializado")
+    else:
+        provider = SimulatedProvider()
+        logger.info("Open Finance simulated provider inicializado (modo desenvolvimento)")
 
     # -------------------------------------------------------------------
     # Utilitários
@@ -689,18 +703,35 @@ def create_app() -> Flask:
     @require_auth
     @limiter.limit("10 per hour")  # IMPORTANT: Limita sync para economizar banda
     def open_finance_sync(user_id: str):
-        """Sincroniza transações via Open Finance (simulado)."""
+        """Sincroniza transações via Open Finance."""
         start_time = time.time()
         session_db = get_session()
+        
         # Validar consent ativo
-        active_consent = session_db.query(Consent).filter(Consent.user_id == user_id, Consent.status == 'active').first()
+        active_consent = session_db.query(Consent).filter(
+            Consent.user_id == user_id,
+            Consent.status == 'active',
+            Consent.deleted_at.is_(None)
+        ).first()
+        
         if not active_consent:
             logger.warning("Tentativa de sync sem consent ativo", extra={"user_id": user_id, "endpoint": "/openfinance/sync", "error_code": "no_active_consent"})
             return jsonify({"error": "no_active_consent", "details": "Nenhum consent ativo encontrado para este usuário."}), 400
         
         logger.info("Sincronização Open Finance iniciada", extra={"user_id": user_id, "endpoint": "/openfinance/sync", "consent_id": active_consent.consent_id})
-        # Usa provider para sincronizar (abstração preparada para múltiplos provedores).
-        result = provider.sync(local_user_id=user_id)
+        
+        # Usa provider para sincronizar
+        # Provider real requer consent_id; provider simulado ignora
+        try:
+            if isinstance(provider, OpenFinanceProvider):
+                result = provider.sync(local_user_id=user_id, consent_id=active_consent.consent_id)
+            else:
+                # SimulatedProvider usa assinatura antiga (sem consent_id)
+                result = provider.sync(local_user_id=user_id)
+        except Exception as e:
+            logger.error("Erro na sincronização Open Finance", extra={"user_id": user_id, "error": str(e)})
+            return jsonify({"error": "sync_failed", "details": str(e)}), 500
+        
         inserted = []
         skipped = 0
 
