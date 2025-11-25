@@ -100,6 +100,30 @@ class Consent(Base):
     deleted_at = Column(DateTime, nullable=True)  # Soft delete timestamp
 
 
+class Investment(Base):
+    __tablename__ = "investments"
+    __table_args__ = (
+        Index('idx_investment_user_date', 'user_id', 'purchase_date'),
+        Index('idx_investment_type', 'asset_type'),
+        Index('idx_investment_deleted_at', 'deleted_at'),
+    )
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    name = Column(String(256), nullable=False)  # ex: "Tesla", "Fundo Imobiliário"
+    asset_type = Column(String(64), nullable=False)  # stocks, reit, crypto, bonds, funds, savings, real_estate, commodities
+    amount = Column(Float, nullable=False)  # quantidade ou valor investido
+    purchase_price = Column(Float, nullable=False)  # preço de compra/cotação
+    current_price = Column(Float, nullable=True)  # preço atual
+    purchase_date = Column(Date, nullable=False)
+    target_return = Column(Float, nullable=True)  # % de retorno esperado
+    status = Column(String(32), nullable=False, default='active')  # active | sold | matured
+    notes = Column(String(1024), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+    deleted_at = Column(DateTime, nullable=True)  # Soft delete timestamp
+
+
 class ConsentSchema(Schema):
     id = fields.Int(dump_only=True)
     user_id = fields.Str(required=True, validate=validate.Length(min=1))
@@ -108,6 +132,22 @@ class ConsentSchema(Schema):
     scopes = fields.Str(required=True)
     status = fields.Str(required=True, validate=validate.OneOf(["active", "revoked", "expired"]))
     created_at = fields.DateTime(dump_only=True)
+
+
+class InvestmentSchema(Schema):
+    id = fields.Int(dump_only=True)
+    user_id = fields.Str(required=True, validate=validate.Length(min=1))
+    name = fields.Str(required=True, validate=validate.Length(min=1))
+    asset_type = fields.Str(required=True, validate=validate.OneOf(["stocks", "reit", "crypto", "bonds", "funds", "savings", "real_estate", "commodities"]))
+    amount = fields.Float(required=True)
+    purchase_price = fields.Float(required=True)
+    current_price = fields.Float(allow_none=True)
+    purchase_date = fields.Date(required=True)
+    target_return = fields.Float(allow_none=True)
+    status = fields.Str(required=True, validate=validate.OneOf(["active", "sold", "matured"]))
+    notes = fields.Str(allow_none=True)
+    created_at = fields.DateTime(dump_only=True)
+    updated_at = fields.DateTime(dump_only=True)
 
 
 class TransactionSchema(Schema):
@@ -132,6 +172,8 @@ transaction_schema = TransactionSchema()
 transactions_schema = TransactionSchema(many=True)
 installment_schema = InstallmentSchema()
 installments_schema = InstallmentSchema(many=True)
+investment_schema = InvestmentSchema()
+investments_schema = InvestmentSchema(many=True)
 consent_schema = ConsentSchema()
 consents_schema = ConsentSchema(many=True)
 
@@ -309,7 +351,6 @@ def create_app() -> Flask:
     # Health
     # -------------------------------------------------------------------
     @app.route("/api/health")
-    @require_auth
     @csrf.exempt  # GET não requer CSRF
     def health():
         return jsonify({"status": "ok"})
@@ -368,6 +409,33 @@ def create_app() -> Flask:
         logger.info("Logout realizado", extra={"user_id": user_id, "endpoint": "/auth/logout", "method": "GET"})
         return jsonify({"message": "Logout realizado"}), 200
 
+    @app.route("/auth/dev-login", methods=['POST'])
+    @csrf.exempt
+    def dev_login():
+        """
+        Endpoint de login para desenvolvimento (SEM OAuth).
+        POST /auth/dev-login
+        Body: {"user_id": "test_user", "email": "test@example.com", "name": "Test User"}
+        """
+        if app.config.get('TESTING') or not use_real_openfinance:
+            data = request.get_json() or {}
+            user_id = data.get('user_id', 'test_user')
+            email = data.get('email', f'{user_id}@example.com')
+            name = data.get('name', 'Test User')
+            
+            session['user'] = {
+                'id': user_id,
+                'email': email,
+                'name': name,
+                'picture': None
+            }
+            logger.info(f"Dev login realizado para {user_id}")
+            return jsonify({
+                "message": "Login de desenvolvimento bem-sucedido",
+                "user": session['user']
+            }), 200
+        return jsonify({"error": "Dev login apenas disponível em ambiente de desenvolvimento"}), 403
+
     @app.route("/auth/me")
     def get_current_user():
         """Retorna usuário autenticado atual."""
@@ -384,6 +452,7 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/openfinance/consents", methods=["POST"])
     @require_auth
+    @csrf.exempt  # Desabilitado para desenvolvimento
     @limiter.limit("20 per hour")  # IMPORTANT: Limita criação de consents
     def create_consent(user_id: str):
         payload = request.get_json(silent=True) or {}
@@ -472,6 +541,7 @@ def create_app() -> Flask:
 
     @app.route("/api/users/<user_id>/transactions", methods=["POST"])
     @require_auth
+    @csrf.exempt  # Desabilitado para desenvolvimento
     @limiter.limit("100 per hour")  # IMPORTANT: Limita criação de transações
     def create_transaction(user_id: str):
         payload = request.get_json(silent=True) or {}
@@ -546,6 +616,191 @@ def create_app() -> Flask:
         txn.deleted_at = datetime.now(UTC)
         session.commit()
         return jsonify({"deleted": txn_id})
+
+    # -------------------------------------------------------------------
+    # Sugestões Financeiras
+    # -------------------------------------------------------------------
+    @app.route("/api/users/<user_id>/suggestions", methods=["GET"])
+    @require_auth
+    @csrf.exempt  # GET não requer CSRF
+    @limiter.limit("50 per hour")
+    def get_suggestions(user_id: str):
+        """
+        Retorna sugestões personalizadas baseadas no histórico financeiro do usuário.
+        Analisa padrões de gastos e oferece recomendações de economia.
+        """
+        session_db = get_session()
+        
+        # Buscar transações dos últimos 30 dias
+        thirty_days_ago = today_date() - timedelta(days=30)
+        recent_txns = session_db.query(Transaction).filter(
+            Transaction.user_id == user_id,
+            Transaction.deleted_at.is_(None),
+            Transaction.date >= thirty_days_ago
+        ).all()
+        
+        suggestions = []
+        
+        if not recent_txns:
+            suggestions.append({
+                "type": "info",
+                "category": "getting_started",
+                "title": "Comece a registrar suas transações",
+                "description": "Adicione suas receitas e despesas para receber sugestões personalizadas",
+                "priority": "high",
+                "icon": "📊"
+            })
+            return jsonify({"suggestions": suggestions})
+        
+        # Calcular estatísticas
+        total_income = sum(float(t.amount) for t in recent_txns if t.type == "income")
+        total_expense = sum(float(t.amount) for t in recent_txns if t.type == "expense")
+        balance = total_income - total_expense
+        
+        # Análise por descrição (categorias informais)
+        expense_categories = {}
+        for txn in recent_txns:
+            if txn.type == "expense":
+                desc = txn.description.lower()
+                # Categorizar por palavras-chave
+                if any(word in desc for word in ['restaurante', 'ifood', 'uber eats', 'almoço', 'jantar', 'lanche']):
+                    category = 'alimentacao'
+                elif any(word in desc for word in ['uber', 'taxi', '99', 'gasolina', 'combustível']):
+                    category = 'transporte'
+                elif any(word in desc for word in ['netflix', 'spotify', 'amazon', 'assinatura', 'streaming']):
+                    category = 'assinaturas'
+                elif any(word in desc for word in ['supermercado', 'mercado', 'compras']):
+                    category = 'supermercado'
+                elif any(word in desc for word in ['energia', 'água', 'internet', 'celular', 'conta']):
+                    category = 'contas'
+                else:
+                    category = 'outros'
+                
+                expense_categories[category] = expense_categories.get(category, 0) + float(txn.amount)
+        
+        # SUGESTÃO 1: Saldo negativo
+        if balance < 0:
+            suggestions.append({
+                "type": "alert",
+                "category": "budget",
+                "title": "Gastos acima das receitas",
+                "description": f"Você gastou R$ {abs(balance):.2f} a mais do que recebeu nos últimos 30 dias. Considere revisar seus gastos.",
+                "priority": "high",
+                "icon": "⚠️",
+                "action": {
+                    "label": "Ver despesas",
+                    "endpoint": f"/api/users/{user_id}/transactions?type=expense"
+                }
+            })
+        
+        # SUGESTÃO 2: Gastos com alimentação elevados
+        if 'alimentacao' in expense_categories:
+            food_expense = expense_categories['alimentacao']
+            if total_income > 0:
+                food_percentage = (food_expense / total_income) * 100
+                if food_percentage > 30:
+                    suggestions.append({
+                        "type": "tip",
+                        "category": "savings",
+                        "title": "Gastos com alimentação elevados",
+                        "description": f"Você gastou R$ {food_expense:.2f} ({food_percentage:.1f}% da sua receita) com alimentação. Considere cozinhar mais em casa.",
+                        "priority": "medium",
+                        "icon": "🍔",
+                        "potential_savings": food_expense * 0.3  # Economia de 30%
+                    })
+        
+        # SUGESTÃO 3: Muitas assinaturas
+        if 'assinaturas' in expense_categories:
+            subscription_expense = expense_categories['assinaturas']
+            suggestions.append({
+                "type": "tip",
+                "category": "subscriptions",
+                "title": "Revise suas assinaturas",
+                "description": f"Você tem R$ {subscription_expense:.2f} em assinaturas. Cancele serviços que não usa.",
+                "priority": "low",
+                "icon": "📺",
+                "potential_savings": subscription_expense * 0.5
+            })
+        
+        # SUGESTÃO 4: Gastos com transporte
+        if 'transporte' in expense_categories:
+            transport_expense = expense_categories['transporte']
+            if transport_expense > 500:
+                suggestions.append({
+                    "type": "tip",
+                    "category": "transport",
+                    "title": "Considere alternativas de transporte",
+                    "description": f"Você gastou R$ {transport_expense:.2f} com transporte. Avalie transporte público ou carona compartilhada.",
+                    "priority": "medium",
+                    "icon": "🚗"
+                })
+        
+        # SUGESTÃO 5: Poucas receitas
+        if len([t for t in recent_txns if t.type == "income"]) < 2:
+            suggestions.append({
+                "type": "info",
+                "category": "income",
+                "title": "Diversifique suas fontes de renda",
+                "description": "Considere buscar fontes alternativas de renda como freelancing ou investimentos.",
+                "priority": "low",
+                "icon": "💰"
+            })
+        
+        # SUGESTÃO 6: Meta de economia (Regra 50-30-20)
+        if total_income > 0:
+            recommended_savings = total_income * 0.20  # 20% da receita
+            actual_savings = balance
+            if actual_savings < recommended_savings:
+                suggestions.append({
+                    "type": "goal",
+                    "category": "savings",
+                    "title": "Meta de economia mensal",
+                    "description": f"Tente economizar 20% da sua receita (R$ {recommended_savings:.2f}). Você está economizando R$ {actual_savings:.2f}.",
+                    "priority": "medium",
+                    "icon": "🎯",
+                    "progress": (actual_savings / recommended_savings * 100) if recommended_savings > 0 else 0
+                })
+        
+        # SUGESTÃO 7: Categoria com maior gasto
+        if expense_categories:
+            max_category = max(expense_categories.items(), key=lambda x: x[1])
+            category_name_map = {
+                'alimentacao': 'Alimentação',
+                'transporte': 'Transporte',
+                'assinaturas': 'Assinaturas',
+                'supermercado': 'Supermercado',
+                'contas': 'Contas Fixas',
+                'outros': 'Outros'
+            }
+            suggestions.append({
+                "type": "insight",
+                "category": "spending_pattern",
+                "title": f"Maior gasto: {category_name_map.get(max_category[0], 'Outros')}",
+                "description": f"Sua categoria com mais gastos é {category_name_map.get(max_category[0], 'Outros')}: R$ {max_category[1]:.2f}",
+                "priority": "low",
+                "icon": "📈"
+            })
+        
+        # Ordenar por prioridade
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        suggestions.sort(key=lambda x: priority_order.get(x.get("priority", "low"), 2))
+        
+        session_db.close()
+        
+        return jsonify({
+            "suggestions": suggestions,
+            "period": {
+                "start": thirty_days_ago.isoformat(),
+                "end": today_date().isoformat(),
+                "days": 30
+            },
+            "summary": {
+                "total_income": round(total_income, 2),
+                "total_expense": round(total_expense, 2),
+                "balance": round(balance, 2),
+                "transactions_count": len(recent_txns)
+            }
+        })
 
     # -------------------------------------------------------------------
     # Installments CRUD
@@ -720,6 +975,7 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/openfinance/sync", methods=["POST"])
     @require_auth
+    @csrf.exempt  # Desabilitado para desenvolvimento
     @limiter.limit("10 per hour")  # IMPORTANT: Limita sync para economizar banda
     def open_finance_sync(user_id: str):
         """Sincroniza transações via Open Finance."""
@@ -787,8 +1043,423 @@ def create_app() -> Flask:
             "imported": len(inserted),
             "skipped_duplicates": skipped,
             "transactions": transactions_schema.dump(inserted),
-            "consent_id": active_consent.consent_id
         }), 201
+
+    # -------------------------------------------------------------------
+    # Investments CRUD
+    # -------------------------------------------------------------------
+    @app.route("/api/users/<user_id>/investments", methods=["GET"])
+    @require_auth
+    @csrf.exempt  # GET não requer CSRF
+    @limiter.limit("100 per hour")
+    def list_investments(user_id: str):
+        """Lista investimentos do usuário com paginação."""
+        page = request.args.get('page', 1, type=int)
+        per_page = min(request.args.get('per_page', 20, type=int), 100)
+        status_filter = request.args.get('status')
+        asset_type_filter = request.args.get('asset_type')
+        
+        session_db = get_session()
+        query = session_db.query(Investment).filter(
+            Investment.user_id == user_id,
+            Investment.deleted_at.is_(None)
+        )
+        
+        if status_filter:
+            query = query.filter(Investment.status == status_filter)
+        if asset_type_filter:
+            query = query.filter(Investment.asset_type == asset_type_filter)
+        
+        query = query.order_by(Investment.purchase_date.desc())
+        paginated = paginate_query(query, page, per_page)
+        session_db.close()
+        
+        return jsonify({
+            "items": investments_schema.dump(paginated["items"]),
+            "pagination": {
+                "total": paginated["total"],
+                "pages": paginated["pages"],
+                "current_page": paginated["current_page"],
+                "per_page": paginated["per_page"]
+            }
+        })
+
+    @app.route("/api/users/<user_id>/investments", methods=["POST"])
+    @require_auth
+    @csrf.exempt  # Desabilitado para desenvolvimento
+    @limiter.limit("100 per hour")  # Limita criação de investimentos
+    def create_investment(user_id: str):
+        """Cria novo investimento."""
+        payload = request.get_json(silent=True) or {}
+        payload["user_id"] = user_id
+        if "purchase_date" not in payload:
+            payload["purchase_date"] = today_date().isoformat()
+        if "status" not in payload:
+            payload["status"] = "active"
+        if "current_price" not in payload:
+            payload["current_price"] = payload.get("purchase_price")
+        
+        data = parse_json(investment_schema, payload)
+        session_db = get_session()
+        inv = Investment(**data)
+        session_db.add(inv)
+        session_db.commit()
+        result = investment_schema.dump(inv)
+        session_db.close()
+        return jsonify(result), 201
+
+    @app.route("/api/users/<user_id>/investments/<int:inv_id>", methods=["PUT", "PATCH"])
+    @require_auth
+    @csrf.exempt  # Desabilitado para desenvolvimento
+    @limiter.limit("100 per hour")
+    def update_investment(user_id: str, inv_id: int):
+        """Atualiza investimento existente."""
+        payload = request.get_json(silent=True) or {}
+        session_db = get_session()
+        inv = session_db.query(Investment).filter(
+            Investment.id == inv_id,
+            Investment.user_id == user_id,
+            Investment.deleted_at.is_(None)
+        ).first()
+        if not inv:
+            raise NotFound("Investimento não encontrado")
+        
+        # Campos permitidos para update
+        for field in ["name", "current_price", "target_return", "status", "notes"]:
+            if field in payload:
+                if field == "current_price":
+                    try:
+                        val = float(payload[field])
+                        if val < 0:
+                            raise ValueError
+                        setattr(inv, field, val)
+                    except Exception:
+                        raise BadRequest({field: ["Valor inválido"]})
+                elif field == "target_return":
+                    try:
+                        val = float(payload[field])
+                        setattr(inv, field, val)
+                    except Exception:
+                        raise BadRequest({field: ["Valor inválido"]})
+                elif field == "status":
+                    if payload[field] not in ["active", "sold", "matured"]:
+                        raise BadRequest({field: ["Status inválido"]})
+                    setattr(inv, field, payload[field])
+                else:
+                    setattr(inv, field, payload[field])
+        
+        inv.updated_at = datetime.now(UTC)
+        session_db.commit()
+        result = investment_schema.dump(inv)
+        session_db.close()
+        return jsonify(result)
+
+    @app.route("/api/users/<user_id>/investments/<int:inv_id>", methods=["DELETE"])
+    @require_auth
+    @csrf.exempt  # Desabilitado para desenvolvimento
+    @limiter.limit("100 per hour")
+    def delete_investment(user_id: str, inv_id: int):
+        """Deleta investimento (soft delete)."""
+        session_db = get_session()
+        inv = session_db.query(Investment).filter(
+            Investment.id == inv_id,
+            Investment.user_id == user_id,
+            Investment.deleted_at.is_(None)
+        ).first()
+        if not inv:
+            raise NotFound("Investimento não encontrado")
+        
+        inv.deleted_at = datetime.now(UTC)
+        session_db.commit()
+        session_db.close()
+        return jsonify({"deleted": inv_id})
+
+    @app.route("/api/users/<user_id>/investments/portfolio", methods=["GET"])
+    @require_auth
+    @csrf.exempt  # GET não requer CSRF
+    @limiter.limit("50 per hour")
+    def get_portfolio_analysis(user_id: str):
+        """Análise detalhada do portfólio de investimentos."""
+        session_db = get_session()
+        
+        investments = session_db.query(Investment).filter(
+            Investment.user_id == user_id,
+            Investment.deleted_at.is_(None),
+            Investment.status == "active"
+        ).all()
+        
+        if not investments:
+            session_db.close()
+            return jsonify({
+                "portfolio": {
+                    "total_invested": 0,
+                    "current_value": 0,
+                    "total_return": 0,
+                    "return_percentage": 0,
+                    "by_asset_type": {},
+                    "count": 0
+                },
+                "recommendations": [
+                    {
+                        "type": "info",
+                        "title": "Comece seu portfólio",
+                        "description": "Você não tem investimentos registrados. Comece adicionando seus investimentos!"
+                    }
+                ]
+            })
+        
+        # Calcular estatísticas
+        total_invested = 0
+        current_value = 0
+        by_asset_type = {}
+        
+        for inv in investments:
+            invested = float(inv.amount) * float(inv.purchase_price) if inv.purchase_price else 0
+            current = float(inv.amount) * float(inv.current_price) if inv.current_price else invested
+            
+            total_invested += invested
+            current_value += current
+            
+            # Agrupar por tipo de ativo
+            asset_type = inv.asset_type
+            if asset_type not in by_asset_type:
+                by_asset_type[asset_type] = {
+                    "invested": 0,
+                    "current_value": 0,
+                    "count": 0,
+                    "return_percentage": 0
+                }
+            
+            by_asset_type[asset_type]["invested"] += invested
+            by_asset_type[asset_type]["current_value"] += current
+            by_asset_type[asset_type]["count"] += 1
+        
+        # Calcular retorno percentual por tipo
+        for asset_type in by_asset_type:
+            if by_asset_type[asset_type]["invested"] > 0:
+                ret = (by_asset_type[asset_type]["current_value"] - by_asset_type[asset_type]["invested"]) / by_asset_type[asset_type]["invested"] * 100
+                by_asset_type[asset_type]["return_percentage"] = round(ret, 2)
+        
+        total_return = current_value - total_invested
+        return_percentage = (total_return / total_invested * 100) if total_invested > 0 else 0
+        
+        # Gerar recomendações
+        recommendations = []
+        
+        # Recomendação 1: Diversificação
+        if len(by_asset_type) < 3:
+            recommendations.append({
+                "type": "tip",
+                "icon": "📊",
+                "title": "Diversifique seu portfólio",
+                "description": "Você tem apenas investimentos em " + str(len(by_asset_type)) + " tipo(s) de ativo. Considere diversificar em stocks, REITs, fundos e outros.",
+                "priority": "medium"
+            })
+        
+        # Recomendação 2: Rendimento ruim
+        if return_percentage < 0:
+            recommendations.append({
+                "type": "alert",
+                "icon": "⚠️",
+                "title": "Portfólio em queda",
+                "description": f"Seu portfólio está em queda de {abs(return_percentage):.2f}%. Revise suas posições.",
+                "priority": "high"
+            })
+        
+        # Recomendação 3: Rendimento bom
+        elif return_percentage > 15:
+            recommendations.append({
+                "type": "success",
+                "icon": "🎉",
+                "title": "Ótimo rendimento!",
+                "description": f"Seu portfólio cresceu {return_percentage:.2f}%! Parabéns!",
+                "priority": "low"
+            })
+        
+        # Recomendação 4: Rebalanceamento
+        largest_asset = max(by_asset_type.items(), key=lambda x: x[1]["current_value"])
+        largest_percentage = (largest_asset[1]["current_value"] / current_value * 100) if current_value > 0 else 0
+        if largest_percentage > 60:
+            recommendations.append({
+                "type": "tip",
+                "icon": "⚖️",
+                "title": "Rebalanceie seu portfólio",
+                "description": f"{largest_asset[0]} representa {largest_percentage:.1f}% do seu portfólio. Considere reduzir essa posição.",
+                "priority": "medium"
+            })
+        
+        session_db.close()
+        
+        return jsonify({
+            "portfolio": {
+                "total_invested": round(total_invested, 2),
+                "current_value": round(current_value, 2),
+                "total_return": round(total_return, 2),
+                "return_percentage": round(return_percentage, 2),
+                "by_asset_type": {k: {
+                    "invested": round(v["invested"], 2),
+                    "current_value": round(v["current_value"], 2),
+                    "count": v["count"],
+                    "return_percentage": v["return_percentage"]
+                } for k, v in by_asset_type.items()},
+                "count": len(investments)
+            },
+            "recommendations": recommendations
+        })
+
+    @app.route("/api/investments/tips", methods=["GET"])
+    @csrf.exempt  # GET não requer CSRF
+    @limiter.limit("50 per hour")
+    def get_investment_tips():
+        """Dicas e conselhos sobre investimentos."""
+        tips = [
+            {
+                "id": 1,
+                "category": "beginner",
+                "icon": "📚",
+                "title": "Entenda os Fundamentos",
+                "description": "Antes de investir, aprenda sobre diferentes tipos de ativos: ações, fundos, REITs, criptomoedas e commodities.",
+                "tips": [
+                    "Ações: propriedade de empresa, pode crescer muito",
+                    "Fundos: carteira diversificada gerenciada por profissional",
+                    "REITs: investimento em imóveis via bolsa",
+                    "Criptomoedas: altamente voláteis, requer cuidado",
+                    "Commodities: preço de matérias-primas"
+                ],
+                "difficulty": "easy"
+            },
+            {
+                "id": 2,
+                "category": "strategy",
+                "icon": "📊",
+                "title": "Regra 50-30-20",
+                "description": "Uma estratégia simples e eficaz para gerenciar suas finanças.",
+                "tips": [
+                    "50% da renda: despesas essenciais (moradia, comida, contas)",
+                    "30% da renda: gastos discricionários (lazer, compras)",
+                    "20% da renda: poupança e investimentos"
+                ],
+                "difficulty": "easy"
+            },
+            {
+                "id": 3,
+                "category": "diversification",
+                "icon": "🎯",
+                "title": "Diversificação do Portfólio",
+                "description": "Não coloque todos os ovos em uma única cesta.",
+                "tips": [
+                    "Distribua investimentos em diferentes tipos de ativos",
+                    "Invista em diferentes setores da economia",
+                    "Considere geograficamente diversificado",
+                    "Mix típico: 60% ações, 30% renda fixa, 10% alternativo"
+                ],
+                "difficulty": "medium"
+            },
+            {
+                "id": 4,
+                "category": "risk",
+                "icon": "⚠️",
+                "title": "Risco vs Retorno",
+                "description": "Quanto maior o retorno esperado, maior o risco.",
+                "tips": [
+                    "Criptomoedas: altíssimo risco e retorno",
+                    "Ações: risco alto, retorno potencial alto",
+                    "Fundos: risco médio, retorno médio",
+                    "Renda fixa: risco baixo, retorno baixo"
+                ],
+                "difficulty": "medium"
+            },
+            {
+                "id": 5,
+                "category": "timing",
+                "icon": "📈",
+                "title": "Compre Regularmente (Dollar Cost Averaging)",
+                "description": "Invista uma quantia fixa regularmente, independente do preço.",
+                "tips": [
+                    "Reduz o impacto da volatilidade",
+                    "Ideal para investidores iniciantes",
+                    "Pode ser automático via débito automático",
+                    "Exemplo: R$ 500 mensais em fundos de índice"
+                ],
+                "difficulty": "easy"
+            },
+            {
+                "id": 6,
+                "category": "emotions",
+                "icon": "😌",
+                "title": "Controle Emocional",
+                "description": "Não venda por pânico ou euforia.",
+                "tips": [
+                    "Ignore notícias de curto prazo",
+                    "Mantenha sua estratégia de longo prazo",
+                    "Não tente 'adivinhar' o mercado",
+                    "Pessoas emocionais perdem dinheiro com consistência"
+                ],
+                "difficulty": "hard"
+            },
+            {
+                "id": 7,
+                "category": "taxation",
+                "icon": "💰",
+                "title": "Impostos em Investimentos",
+                "description": "Entenda como os impostos afetam seus retornos.",
+                "tips": [
+                    "Imposto de renda em ganho de capital",
+                    "Fundos imobiliários têm tributação especial",
+                    "Renda fixa tributada como renda normal",
+                    "Planeje suas vendas para otimizar impostos"
+                ],
+                "difficulty": "hard"
+            },
+            {
+                "id": 8,
+                "category": "emergency",
+                "icon": "🏦",
+                "title": "Tenha um Fundo de Emergência",
+                "description": "Antes de investir, tenha de 3-6 meses de despesas guardadas.",
+                "tips": [
+                    "Deixe em conta poupança ou aplicação de renda fixa",
+                    "Fácil acesso em caso de necessidade",
+                    "Evita necessidade de vender investimentos com prejuízo",
+                    "Traz paz de espírito"
+                ],
+                "difficulty": "easy"
+            },
+            {
+                "id": 9,
+                "category": "passive_income",
+                "icon": "🌱",
+                "title": "Renda Passiva",
+                "description": "Deixe seu dinheiro trabalhar para você.",
+                "tips": [
+                    "Dividendos de ações: ganho periódico",
+                    "Fundos imobiliários: aluguel distribuído",
+                    "Renda fixa: juros periódicos",
+                    "Juros compostos: efeito exponencial no longo prazo"
+                ],
+                "difficulty": "medium"
+            },
+            {
+                "id": 10,
+                "category": "rebalancing",
+                "icon": "⚙️",
+                "title": "Rebalanceie Regularmente",
+                "description": "Ajuste seu portfólio para manter o alvo.",
+                "tips": [
+                    "Rebalanceie anualmente ou semestralmente",
+                    "Se uma categoria ficou muito grande, reduza",
+                    "Se uma categoria ficou pequena, aumente",
+                    "Aproveite para otimizar impostos"
+                ],
+                "difficulty": "medium"
+            }
+        ]
+        
+        return jsonify({
+            "tips": tips,
+            "total": len(tips),
+            "categories": list(set([t["category"] for t in tips]))
+        })
 
     @app.route("/api/openfinance/webhook", methods=["POST"])
     @csrf.exempt  # Webhooks são chamados por serviços externos, não podem ter CSRF
