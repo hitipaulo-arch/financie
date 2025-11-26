@@ -37,8 +37,10 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Configuração
 # ---------------------------------------------------------------------------
-DB_URL = os.getenv("GF_DB_URL", "sqlite:///data.db")
-FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
+# Suporta tanto DATABASE_URL (Azure) quanto GF_DB_URL (local)
+DB_URL = os.getenv("DATABASE_URL") or os.getenv("GF_DB_URL", "sqlite:///data.db")
+# Suporta tanto SECRET_KEY (Azure) quanto FLASK_SECRET_KEY (local)
+FLASK_SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 
