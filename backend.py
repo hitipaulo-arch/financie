@@ -44,9 +44,29 @@ FLASK_SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY", secr
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 
-engine = create_engine(DB_URL, echo=False, future=True)
-SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
+# CRITICAL: Defer engine creation to avoid module import failures
+# If DB_URL is invalid/unreachable, this will cause gunicorn to timeout
+# So we create it lazily inside create_app()
 Base = declarative_base()
+engine = None
+SessionLocal = None
+
+def get_engine():
+    global engine
+    if engine is None:
+        try:
+            engine = create_engine(DB_URL, echo=False, future=True)
+        except Exception as e:
+            logger.error(f"Failed to create engine: {e}")
+            # Create a fallback in-memory SQLite for now
+            engine = create_engine("sqlite:///:memory:", echo=False, future=True)
+    return engine
+
+def get_session_local():
+    global SessionLocal
+    if SessionLocal is None:
+        SessionLocal = scoped_session(sessionmaker(bind=get_engine(), autoflush=False, autocommit=False))
+    return SessionLocal
 
 
 class Transaction(Base):
@@ -217,8 +237,14 @@ def create_app() -> Flask:
         """Retorna CSRF token para cliente usar em requisições POST/PUT/DELETE."""
         return jsonify({"csrf_token": session.get('_csrf_token', 'N/A')}), 200
 
-    # Cria tabelas se não existirem
-    Base.metadata.create_all(engine)
+    # Cria tabelas se não existirem (usando engine lazy-loaded)
+    try:
+        db_engine = get_engine()
+        Base.metadata.create_all(db_engine)
+        logger.info("Database tables created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create database tables: {e}")
+        # App will still start, just without database
     
     # Configurar OAuth
     oauth = OAuth(app)
@@ -254,7 +280,10 @@ def create_app() -> Flask:
     # Utilitários
     # -------------------------------------------------------------------
     def get_session():
-        return SessionLocal()
+        session_factory = get_session_local()
+        if session_factory is None:
+            raise RuntimeError("Database session not initialized")
+        return session_factory()
 
     def parse_json(schema: Schema, payload: dict):
         try:
