@@ -11,11 +11,12 @@ Persistência: SQLite via SQLAlchemy.
 Serialização/validação: Marshmallow.
 """
 
-from datetime import datetime, date, UTC
+from datetime import datetime, date, timedelta, UTC
 from typing import Optional
+import hashlib
+import hmac
 import secrets
 from functools import wraps
-from datetime import timedelta
 import time
 
 from flask import Flask, jsonify, request, redirect, url_for, session
@@ -40,9 +41,36 @@ load_dotenv()
 # Suporta tanto DATABASE_URL (Azure) quanto GF_DB_URL (local)
 DB_URL = os.getenv("DATABASE_URL") or os.getenv("GF_DB_URL", "sqlite:///data.db")
 # Suporta tanto SECRET_KEY (Azure) quanto FLASK_SECRET_KEY (local)
-FLASK_SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
+_SECRET_KEY_CONFIGURED = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY")
+FLASK_SECRET_KEY = _SECRET_KEY_CONFIGURED or secrets.token_hex(32)
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+
+
+def env_flag(name: str, default: str = "false") -> bool:
+    """Interpreta uma variável de ambiente booleana de forma previsível.
+
+    Aceita 1/true/yes/on (case-insensitive) como verdadeiro; qualquer outro
+    valor (inclusive ausente) é falso, a menos que `default` diga o contrário.
+    """
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# Ambiente
+# ---------------------------------------------------------------------------
+# Fail-closed: na ausência de APP_ENV assumimos produção, para que recursos de
+# desenvolvimento nunca fiquem ativos por acidente num deploy.
+APP_ENV = os.getenv("APP_ENV", "production").strip().lower()
+# O Azure App Service sempre define WEBSITE_SITE_NAME; usamos como reforço para
+# que um APP_ENV errado não consiga "ligar" modo desenvolvimento na nuvem.
+IS_PRODUCTION = APP_ENV in ("production", "prod") or bool(os.getenv("WEBSITE_SITE_NAME"))
+
+# Porta dos fundos de desenvolvimento (/auth/dev-login).
+# Antes era liberada por `not OPENFINANCE_ENABLE_REAL`, cujo default é false —
+# ou seja, ficava ABERTA EM PRODUÇÃO e permitia assumir a identidade de
+# qualquer user_id. Agora exige opt-in explícito E ambiente não-produtivo.
+DEV_LOGIN_ENABLED = env_flag("ENABLE_DEV_LOGIN") and not IS_PRODUCTION
 
 # CRITICAL: Defer engine creation to avoid module import failures
 # If DB_URL is invalid/unreachable, this will cause gunicorn to timeout
@@ -201,10 +229,23 @@ consents_schema = ConsentSchema(many=True)
 
 
 def create_app() -> Flask:
-    # Serve arquivos estáticos (ex.: index_api.html) a partir da raiz do projeto
-    app = Flask(__name__, static_url_path='', static_folder='.')
+    # Arquivos estáticos servidos SOMENTE a partir de ./static.
+    # Antes: static_folder='.' expunha pela web qualquer arquivo da raiz do
+    # projeto (verificado: GET /backend.py, GET /.env e GET /.git/config
+    # respondiam 200). Se houver frontend, coloque os arquivos em static/.
+    app = Flask(__name__, static_url_path="/static", static_folder="static")
     app.secret_key = FLASK_SECRET_KEY
-    
+
+    if IS_PRODUCTION and not _SECRET_KEY_CONFIGURED:
+        # Não derrubamos o app (isso quebraria deploys já existentes), mas o
+        # aviso é crítico: sem SECRET_KEY fixa cada worker/instância/restart
+        # gera uma chave nova e invalida todas as sessões.
+        logger.critical(
+            "SECRET_KEY/FLASK_SECRET_KEY não configurada em produção: sessões "
+            "serão invalidadas a cada restart e divergirão entre workers",
+            extra={"error_code": "secret_key_missing"},
+        )
+
     # CORS com suporte a credenciais
     CORS(app, supports_credentials=True, origins=["http://localhost:5000", "http://127.0.0.1:5000"])
 
@@ -220,9 +261,11 @@ def create_app() -> Flask:
     csrf = CSRFProtect(app)
 
     # Configuração de cookies/sessão (controlada por .env)
+    # SESSION_COOKIE_SECURE assume "true" em produção (fail-closed): o Azure
+    # serve HTTPS, então o cookie de sessão nunca deve trafegar em claro.
     app.config.update(
-        SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true",
-        SESSION_COOKIE_HTTPONLY=os.getenv("SESSION_COOKIE_HTTPONLY", "true").lower() == "true",
+        SESSION_COOKIE_SECURE=env_flag("SESSION_COOKIE_SECURE", "true" if IS_PRODUCTION else "false"),
+        SESSION_COOKIE_HTTPONLY=env_flag("SESSION_COOKIE_HTTPONLY", "true"),
         SESSION_COOKIE_SAMESITE=os.getenv("SESSION_COOKIE_SAMESITE", "Lax"),
         PERMANENT_SESSION_LIFETIME=timedelta(minutes=int(os.getenv("SESSION_LIFETIME_MINUTES", "120")))
     )
@@ -371,12 +414,43 @@ def create_app() -> Flask:
         return jsonify({"error": "not_found", "details": e.message}), 404
 
     from werkzeug.exceptions import HTTPException
+
+    @app.errorhandler(ValidationError)
+    def handle_validation_error(e: ValidationError) -> tuple:
+        """Marshmallow ValidationError fora de `parse_json` -> 400.
+
+        Antes escapava como 500 `internal_error` com as mensagens internas do
+        schema no corpo da resposta (ex.: POST /openfinance/consents).
+        """
+        return jsonify({"error": "bad_request", "details": e.messages}), 400
+
     @app.errorhandler(Exception)
     def handle_generic(e: Exception) -> tuple:
         # Evita transformar 404/405 etc em 500
         if isinstance(e, HTTPException):
             return jsonify({"error": e.name.lower().replace(' ', '_'), "details": e.description}), e.code
-        return jsonify({"error": "internal_error", "details": str(e)}), 500
+        # Nunca devolver `str(e)` ao cliente: mensagens de driver de banco,
+        # strings de conexão e detalhes de configuração vazavam na resposta.
+        # O detalhe vai para o log, correlacionado por `error_id`.
+        error_id = secrets.token_hex(8)
+        try:
+            context = {
+                "endpoint": request.path,
+                "method": request.method,
+                "user_id": (session.get("user") or {}).get("id"),
+            }
+        except Exception:  # fora de um request context
+            context = {}
+        logger.error(
+            "Erro interno não tratado",
+            exc_info=e,
+            extra={**context, "error_code": error_id},
+        )
+        return jsonify({
+            "error": "internal_error",
+            "details": "Erro interno do servidor.",
+            "error_id": error_id,
+        }), 500
 
     # -------------------------------------------------------------------
     # Health
@@ -429,8 +503,17 @@ def create_app() -> Flask:
             logger.warning("Informações de usuário não obtidas", extra={"endpoint": "/auth/callback", "error_code": "no_user_info"})
             return jsonify({"error": "Falha ao obter informações do usuário"}), 400
         except Exception as e:
-            logger.error("Erro no callback OAuth", extra={"endpoint": "/auth/callback", "error_code": "oauth_error", "exception": str(e)})
-            return jsonify({"error": str(e)}), 400
+            # Detalhe só no log: `str(e)` do Authlib expunha state/nonce e
+            # erros internos do fluxo OAuth ao cliente.
+            logger.error(
+                "Erro no callback OAuth",
+                exc_info=e,
+                extra={"endpoint": "/auth/callback", "method": "GET", "error_code": "oauth_error"},
+            )
+            return jsonify({
+                "error": "oauth_callback_failed",
+                "details": "Não foi possível concluir o login com o Google.",
+            }), 400
 
     @app.route("/auth/logout")
     def logout():
@@ -447,25 +530,53 @@ def create_app() -> Flask:
         Endpoint de login para desenvolvimento (SEM OAuth).
         POST /auth/dev-login
         Body: {"user_id": "test_user", "email": "test@example.com", "name": "Test User"}
+
+        SEGURANÇA: desativado por padrão. Só responde quando
+        `ENABLE_DEV_LOGIN=true` E o ambiente não é produção
+        (`APP_ENV != production` e sem `WEBSITE_SITE_NAME`). Em testes
+        (`app.config['TESTING']`) também é liberado.
+
+        Antes a condição era `not OPENFINANCE_ENABLE_REAL`, cujo default é
+        false — ou seja, a porta dos fundos ficava aberta em produção e
+        permitia a qualquer pessoa assumir a sessão de um `user_id` arbitrário
+        (inclusive o `sub` do Google de um usuário real) e ler/alterar os dados
+        financeiros dele.
         """
-        if app.config.get('TESTING') or not use_real_openfinance:
-            data = request.get_json() or {}
-            user_id = data.get('user_id', 'test_user')
-            email = data.get('email', f'{user_id}@example.com')
-            name = data.get('name', 'Test User')
-            
-            session['user'] = {
-                'id': user_id,
-                'email': email,
-                'name': name,
-                'picture': None
-            }
-            logger.info(f"Dev login realizado para {user_id}")
+        if not (app.config.get('TESTING') or DEV_LOGIN_ENABLED):
+            logger.warning(
+                "Tentativa de dev-login com o recurso desativado",
+                extra={
+                    "endpoint": "/auth/dev-login",
+                    "method": "POST",
+                    "error_code": "dev_login_disabled",
+                },
+            )
             return jsonify({
-                "message": "Login de desenvolvimento bem-sucedido",
-                "user": session['user']
-            }), 200
-        return jsonify({"error": "Dev login apenas disponível em ambiente de desenvolvimento"}), 403
+                "error": "dev_login_disabled",
+                "details": "Login de desenvolvimento desativado. "
+                           "Defina ENABLE_DEV_LOGIN=true apenas em ambiente local.",
+            }), 403
+
+        data = request.get_json(silent=True) or {}
+        # Limita tamanho dos campos para não gravar lixo arbitrário na sessão.
+        user_id = str(data.get('user_id') or 'test_user').strip()[:64] or 'test_user'
+        email = str(data.get('email') or f'{user_id}@example.com').strip()[:254]
+        name = str(data.get('name') or 'Test User').strip()[:120]
+
+        session['user'] = {
+            'id': user_id,
+            'email': email,
+            'name': name,
+            'picture': None
+        }
+        logger.info(
+            "Dev login realizado",
+            extra={"user_id": user_id, "endpoint": "/auth/dev-login", "method": "POST"},
+        )
+        return jsonify({
+            "message": "Login de desenvolvimento bem-sucedido",
+            "user": session['user']
+        }), 200
 
     @app.route("/auth/me")
     def get_current_user():
@@ -1035,8 +1146,17 @@ def create_app() -> Flask:
                 # SimulatedProvider usa assinatura antiga (sem consent_id)
                 result = provider.sync(local_user_id=user_id)
         except Exception as e:
-            logger.error("Erro na sincronização Open Finance", extra={"user_id": user_id, "error": str(e)})
-            return jsonify({"error": "sync_failed", "details": str(e)}), 500
+            logger.error(
+                "Erro na sincronização Open Finance",
+                exc_info=e,
+                extra={"user_id": user_id, "endpoint": "/openfinance/sync", "error_code": "sync_failed"},
+            )
+            # `str(e)` vazava configuração interna do provider
+            # (ex.: "Configurações faltantes: OPENFINANCE_CLIENT_SECRET").
+            return jsonify({
+                "error": "sync_failed",
+                "details": "Falha na sincronização com o Open Finance.",
+            }), 500
         
         inserted = []
         skipped = 0
@@ -1506,27 +1626,47 @@ def create_app() -> Flask:
         - account.updated: Dados da conta foram atualizados
         """
         start_time = time.time()
-        
-        # Validar assinatura do webhook (se configurado)
+
+        # Fail-closed: sem OPENFINANCE_WEBHOOK_SECRET o endpoint fica
+        # DESATIVADO. Antes a verificação era condicional (`if webhook_secret:`),
+        # então na ausência do segredo qualquer pessoa podia enviar
+        # {"event": "consent.revoked", "consent_id": "..."} e revogar/expirar
+        # consentimentos de terceiros.
         webhook_secret = os.getenv("OPENFINANCE_WEBHOOK_SECRET")
-        if webhook_secret:
-            signature = request.headers.get("X-Webhook-Signature")
-            if not signature:
-                logger.warning("Webhook sem assinatura recebido", extra={"endpoint": "/openfinance/webhook"})
-                return jsonify({"error": "missing_signature"}), 401
-            
-            # Verificar assinatura HMAC
-            import hmac
-            import hashlib
-            expected_signature = hmac.new(
-                webhook_secret.encode(),
-                request.get_data(),
-                hashlib.sha256
-            ).hexdigest()
-            
-            if not hmac.compare_digest(signature, expected_signature):
-                logger.warning("Webhook com assinatura inválida", extra={"endpoint": "/openfinance/webhook"})
-                return jsonify({"error": "invalid_signature"}), 401
+        if not webhook_secret:
+            logger.error(
+                "Webhook Open Finance recebido sem OPENFINANCE_WEBHOOK_SECRET configurado",
+                extra={"endpoint": "/openfinance/webhook", "error_code": "webhook_not_configured"},
+            )
+            return jsonify({
+                "error": "webhook_not_configured",
+                "details": "Recepção de webhooks desativada por falta de configuração.",
+            }), 503
+
+        signature = (request.headers.get("X-Webhook-Signature") or "").strip()
+        if not signature:
+            logger.warning(
+                "Webhook sem assinatura recebido",
+                extra={"endpoint": "/openfinance/webhook", "error_code": "missing_signature"},
+            )
+            return jsonify({"error": "missing_signature"}), 401
+
+        # Aceita tanto "<hex>" quanto "sha256=<hex>".
+        if signature.lower().startswith("sha256="):
+            signature = signature.split("=", 1)[1].strip()
+
+        expected_signature = hmac.new(
+            webhook_secret.encode(),
+            request.get_data(),
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(signature.lower(), expected_signature.lower()):
+            logger.warning(
+                "Webhook com assinatura inválida",
+                extra={"endpoint": "/openfinance/webhook", "error_code": "invalid_signature"},
+            )
+            return jsonify({"error": "invalid_signature"}), 401
         
         try:
             payload = request.get_json()
@@ -1546,8 +1686,10 @@ def create_app() -> Flask:
                 "consent_id": consent_id
             })
             
-            # Usar sessão do banco
-            db = SessionLocal()
+            # Usar sessão do banco (get_session_local() inicializa sob demanda;
+            # o global SessionLocal ainda é None se o webhook for a 1ª rota
+            # chamada após o boot, o que causava TypeError -> 500).
+            db = get_session_local()()
             try:
                 # Buscar consentimento
                 consent = db.query(Consent).filter(
