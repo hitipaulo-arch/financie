@@ -38,7 +38,9 @@ jobs:
         run: |
           source antenv/bin/activate
           pip install pip-audit
-          pip-audit --strict --progress-spinner off
+          # Auditamos o requirements.txt (e nao o ambiente inteiro) para
+          # nao sinalizar pip/setuptools do runner, que sao ferramental de build.
+          pip-audit --strict --progress-spinner off -r requirements.txt
 
       - name: Testes de regressão de segurança (pytest)
         run: |

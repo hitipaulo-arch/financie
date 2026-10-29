@@ -35,10 +35,15 @@ jobs:
           pip install -r requirements.txt
           pip install pip-audit
 
-      # 🔒 Bloqueia o merge se qualquer dependência fixada (ou transitiva
-      # instalada) tiver vulnerabilidade conhecida.
+      # 🔒 Bloqueia o merge se qualquer dependência do projeto (ou transitiva
+      # dela) tiver vulnerabilidade conhecida.
+      #
+      # Auditamos o requirements.txt, e não o ambiente inteiro: sem `-r` o
+      # pip-audit também avalia pip/setuptools/pip-audit instalados no runner,
+      # que são ferramental de build e não fazem parte do deploy — o resultado
+      # é falha permanente por ruído (aconteceu na primeira execução deste CI).
       - name: Dependency audit (pip-audit)
-        run: pip-audit --strict --progress-spinner off
+        run: pip-audit --strict --progress-spinner off -r requirements.txt
 
       - name: Testes de regressão de segurança (pytest)
         run: pytest -v
