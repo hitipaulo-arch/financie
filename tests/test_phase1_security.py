@@ -36,20 +36,32 @@ BASE_ENV = {
     "SESSION_LIFETIME_MINUTES": "120",
 }
 
+# Toda variável de ambiente que o backend lê. `build_app` limpa todas antes de
+# aplicar o cenário do teste — sem isso um teste vaza configuração para o
+# seguinte (o módulo resolve as flags no import).
+APP_ENV_VARS = [
+    "APP_ENV", "ENABLE_DEV_LOGIN", "WEBSITE_SITE_NAME",
+    "OPENFINANCE_ENABLE_REAL", "OPENFINANCE_WEBHOOK_SECRET",
+    "OPENFINANCE_BASE_URL", "OPENFINANCE_CLIENT_ID", "OPENFINANCE_CLIENT_SECRET",
+    "OPENFINANCE_CERT_PATH", "OPENFINANCE_KEY_PATH",
+    "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
+    "SESSION_COOKIE_SECURE", "SESSION_COOKIE_HTTPONLY", "SESSION_COOKIE_SAMESITE",
+    "FRONTEND_ORIGINS", "APP_BASE_URL", "POST_LOGIN_PATH",
+    "TRUSTED_PROXY_COUNT", "RATELIMIT_STORAGE_URI", "RATELIMIT_ENABLED",
+    "WTF_CSRF_SSL_STRICT", "FLASK_DEBUG", "FLASK_RUN_HOST", "PORT",
+]
 
-def build_app(extra_env: dict | None = None):
-    """Recarrega o módulo `backend` com o ambiente desejado e devolve o app.
 
-    O reload é necessário porque as flags de segurança (APP_ENV,
-    DEV_LOGIN_ENABLED, IS_PRODUCTION) são resolvidas no import do módulo.
+def reload_backend(extra_env: dict | None = None):
+    """Aplica o ambiente e recarrega o módulo `backend` (sem criar o app).
+
+    O reload é necessário porque as flags (APP_ENV, DEV_LOGIN_ENABLED,
+    IS_PRODUCTION, FRONTEND_ORIGINS...) são resolvidas no import do módulo.
     """
     env = dict(BASE_ENV)
     env.update(extra_env or {})
 
-    for key in ("APP_ENV", "ENABLE_DEV_LOGIN", "WEBSITE_SITE_NAME",
-                "OPENFINANCE_ENABLE_REAL", "OPENFINANCE_WEBHOOK_SECRET",
-                "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
-                "SESSION_COOKIE_SECURE"):
+    for key in APP_ENV_VARS:
         os.environ.pop(key, None)
 
     for key, value in env.items():
@@ -58,9 +70,13 @@ def build_app(extra_env: dict | None = None):
         else:
             os.environ.pop(key, None)
 
-    backend = importlib.reload(importlib.import_module("backend"))
-    app = backend.create_app()
-    return backend, app
+    return importlib.reload(importlib.import_module("backend"))
+
+
+def build_app(extra_env: dict | None = None):
+    """Recarrega o `backend` com o ambiente desejado e devolve (módulo, app)."""
+    backend = reload_backend(extra_env)
+    return backend, backend.create_app()
 
 
 def login(client, user_id: str = "u1"):
@@ -72,6 +88,20 @@ def login(client, user_id: str = "u1"):
             "name": "Usuário de Teste",
             "picture": None,
         }
+
+
+def csrf_headers(client) -> dict:
+    """Faz o que qualquer cliente real precisa fazer antes de escrever:
+    GET /api/csrf-token e devolver o header X-CSRFToken.
+
+    Na Fase 2 o CSRF passou a ser exigido de forma uniforme em toda rota que
+    muda estado, então os testes de escrita usam este helper.
+    """
+    resp = client.get("/api/csrf-token")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    token = resp.get_json()["csrf_token"]
+    assert token and token != "N/A", "endpoint de CSRF não devolveu um token real"
+    return {"X-CSRFToken": token}
 
 
 @pytest.fixture
@@ -260,7 +290,8 @@ def test_erro_de_validacao_do_marshmallow_vira_400(prod_app):
     login(client)
 
     resp = client.post("/api/users/u1/openfinance/consents",
-                       json={"status": "valor-invalido"})
+                       json={"status": "valor-invalido"},
+                       headers=csrf_headers(client))
     assert resp.status_code == 400
     body = resp.get_json()
     assert body["error"] == "bad_request"
@@ -286,9 +317,11 @@ def test_falha_de_sync_nao_vaza_configuracao(tmp_path):
 
     client = app.test_client()
     login(client)
-    assert client.post("/api/users/u1/openfinance/consents", json={}).status_code == 201
+    headers = csrf_headers(client)
+    assert client.post("/api/users/u1/openfinance/consents", json={},
+                       headers=headers).status_code == 201
 
-    resp = client.post("/api/users/u1/openfinance/sync")
+    resp = client.post("/api/users/u1/openfinance/sync", headers=headers)
     body = resp.get_data(as_text=True)
 
     assert resp.status_code == 500
@@ -459,7 +492,7 @@ def test_crud_autenticado_continua_funcionando(prod_app):
 
     criada = client.post("/api/users/u1/transactions", json={
         "description": "Salário", "amount": 5000, "type": "income",
-    })
+    }, headers=csrf_headers(client))
     assert criada.status_code == 201, criada.get_data(as_text=True)
 
     listing = client.get("/api/users/u1/transactions")

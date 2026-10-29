@@ -58,12 +58,29 @@ python backend.py
 ```
 Serve em `http://localhost:5000`.
 
-**Atalho Windows:**
+Para desenvolvimento local com login sem Google:
 ```powershell
-.\start_backend.bat
-# ou
-.\start_backend.ps1
+$env:APP_ENV = "development"
+$env:ENABLE_DEV_LOGIN = "true"
+python backend.py
 ```
+
+O modo debug do Werkzeug **fica desligado por padrão** (`FLASK_DEBUG=true` para
+ligar). Ele nunca deve ser ativado num host acessível: o console interativo
+permite execução remota de código.
+
+Host/porta configuráveis por `FLASK_RUN_HOST` e `PORT`.
+
+**Entry points:**
+| Uso | Comando |
+|-----|---------|
+| Produção (Azure/gunicorn) | `gunicorn ... wsgi:app` (ver `startup.txt`) |
+| Flask CLI | `flask --app backend:create_app run` |
+| Desenvolvimento | `python backend.py` |
+
+> O módulo `backend` **não** cria o app no import (`from backend import Base`,
+> usado pelo Alembic, não abre mais conexão com o banco). `backend.app` ainda
+> existe por compatibilidade, mas é criado sob demanda.
 
 ## Testar Backend
 ```powershell
@@ -207,21 +224,74 @@ Arquivo `providers.py` define:
 
 O endpoint de sync usa a abstração (`provider.sync(...)`). Para integrar um provedor real, criar nova classe implementando `fetch_transactions`.
 
+## CSRF (obrigatório em toda escrita)
+
+Toda requisição `POST`, `PUT`, `PATCH` ou `DELETE` exige um token CSRF. `GET`,
+`HEAD` e `OPTIONS` nunca exigem.
+
+Fluxo do cliente:
+```js
+// 1) obter o token (uma vez por sessão — ele é reutilizável)
+const { csrf_token } = await fetch('/api/csrf-token', { credentials: 'include' }).then(r => r.json());
+
+// 2) enviar no header em toda escrita
+await fetch(`/api/users/${userId}/transactions`, {
+  method: 'POST',
+  credentials: 'include',
+  headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrf_token },
+  body: JSON.stringify({ description: 'Salário', amount: 5000, type: 'income' }),
+});
+```
+
+Headers aceitos: `X-CSRFToken` ou `X-CSRF-Token`. Em formulários, o campo
+`csrf_token`.
+
+O token não expira antes da sessão (`WTF_CSRF_TIME_LIMIT=None`); a sessão dura
+`SESSION_LIFETIME_MINUTES` (padrão 120).
+
+**Únicas isenções** (documentadas no decorador):
+| Rota | Por quê |
+|------|---------|
+| `POST /api/openfinance/webhook` | Chamada por serviço externo; autenticada por HMAC (`X-Webhook-Signature`) |
+| `POST /auth/dev-login` | Só existe fora de produção e o chamador ainda não tem sessão |
+
+Sem token a resposta é `400`:
+```json
+{"error": "bad_request", "details": "The CSRF token is missing."}
+```
+
+> Em produção (HTTPS), o Flask-WTF também exige que o header `Referer` confira
+> com o host (`WTF_CSRF_SSL_STRICT`, padrão `true`). Clientes de API que não são
+> navegador precisam enviar `Referer` ou definir `WTF_CSRF_SSL_STRICT=false`.
+
 ## Exemplos `curl`
 ```bash
-# Criar transação
-curl -X POST http://localhost:5000/api/users/demo/transactions \
-  -H "Content-Type: application/json" \
+BASE=http://localhost:5000
+JAR=/tmp/cookies.txt
+
+# 0) autenticar (apenas em desenvolvimento, com ENABLE_DEV_LOGIN=true)
+curl -c $JAR -X POST $BASE/auth/dev-login \
+  -H "Content-Type: application/json" -d '{"user_id":"demo"}'
+
+# 1) obter o token CSRF
+TOKEN=$(curl -s -b $JAR -c $JAR $BASE/api/csrf-token | python -c "import sys,json;print(json.load(sys.stdin)['csrf_token'])")
+
+# 2) criar transação
+curl -b $JAR -c $JAR -X POST $BASE/api/users/demo/transactions \
+  -H "Content-Type: application/json" -H "X-CSRFToken: $TOKEN" \
   -d '{"description":"Salário","amount":5000,"type":"income"}'
 
-# Listar transações
-curl http://localhost:5000/api/users/demo/transactions
+# 3) atualizar / remover
+curl -b $JAR -c $JAR -X PUT $BASE/api/users/demo/transactions/1 \
+  -H "Content-Type: application/json" -H "X-CSRFToken: $TOKEN" -d '{"amount":6000}'
+curl -b $JAR -c $JAR -X DELETE $BASE/api/users/demo/transactions/1 -H "X-CSRFToken: $TOKEN"
 
-# Resumo
-curl http://localhost:5000/api/users/demo/summary
+# Leituras não precisam de token
+curl -b $JAR $BASE/api/users/demo/transactions
+curl -b $JAR $BASE/api/users/demo/summary
 
 # Importar extrato simulado
-curl -X POST http://localhost:5000/api/users/demo/import
+curl -b $JAR -c $JAR -X POST $BASE/api/users/demo/import -H "X-CSRFToken: $TOKEN"
 ```
 
 ## Variáveis de Ambiente
@@ -239,6 +309,19 @@ curl -X POST http://localhost:5000/api/users/demo/import
 | `SESSION_COOKIE_SAMESITE` | Política SameSite do cookie | `Lax` |
 | `SESSION_LIFETIME_MINUTES` | Duração da sessão | `120` |
 | `LOG_LEVEL` | Nível do log estruturado JSON | `INFO` |
+| `FRONTEND_ORIGINS` | Origens autorizadas no CORS (separadas por vírgula) | `http://localhost:5000,http://127.0.0.1:5000` |
+| `APP_BASE_URL` | URL pública da app; base do redirect pós-login | derivada do request |
+| `POST_LOGIN_PATH` | Caminho interno para onde ir após o login Google | `/static/index.html` |
+| `TRUSTED_PROXY_COUNT` | Proxies reversos confiáveis (Azure App Service = 1) | `1` |
+| `RATELIMIT_STORAGE_URI` | Backend do rate limiter. `memory://` conta por instância; use Redis se escalar | `memory://` |
+| `RATELIMIT_ENABLED` | Liga/desliga o rate limiting (útil em testes) | `true` |
+| `WTF_CSRF_SSL_STRICT` | Em HTTPS, exige `Referer` igual ao host | `true` |
+| `FLASK_DEBUG` | Modo debug do Werkzeug **apenas** em `python backend.py` | `false` |
+| `FLASK_RUN_HOST` / `PORT` | Host e porta do servidor de desenvolvimento | `0.0.0.0` / `5000` |
+
+> `RATELIMIT_STORAGE_URI=redis://...` exige o extra `limits[redis]`
+> (`pip install limits[redis]`), que não vem no `requirements.txt`. Sem o
+> pacote o app **não sobe** — de propósito, para não silenciar a configuração.
 
 Exemplo para usar outro ficheiro:
 ```powershell
@@ -261,11 +344,47 @@ Regras em vigor desde a Fase 1 (2026-10-29):
 | **Cookies** | `Secure` por padrão em produção, `HttpOnly` sempre, `SameSite=Lax`. |
 | **Dependências** | Todas fixadas em `requirements.txt`; `pip-audit --strict` roda no CI e bloqueia o deploy. |
 
-### Ainda pendente (Fases 2–4)
-- **CSRF**: `POST/PUT/DELETE` de `installments`, `PUT/PATCH/DELETE` de `transactions` e `POST /import` respondem `400` porque `/api/csrf-token` não entrega um token válido. Correção prevista na Fase 2.
-- **CORS/redirect** fixos em `http://localhost:5000` — precisam vir de variável de ambiente (Fase 2).
-- **Sessão de banco** sem `teardown`/`rollback` (Fase 2).
-- **Rate limiting** global de `200/dia` e `50/hora` atinge `/api/health` e estáticos (Fase 2).
+Regras acrescentadas na Fase 2:
+
+| Tema | Comportamento |
+|------|---------------|
+| **CSRF** | Política uniforme: toda rota que muda estado exige o token de `GET /api/csrf-token` no header `X-CSRFToken`. Só duas isenções, ambas documentadas (webhook e dev-login). Antes havia 18 `@csrf.exempt` avulsos e o endpoint de token devolvia `"N/A"` — 6 endpoints de escrita estavam inutilizáveis. |
+| **Sessão de banco** | `teardown_appcontext` faz `rollback()` em erro e `remove()` ao fim de **todo** request. Antes a sessão scoped ficava presa à thread do worker e um request que falhava no meio deixava alterações pendentes que o request seguinte commitava. |
+| **Rate limiting** | Default folgado (`500/hora`, `5000/dia`) e isenção para `/api/health`, `/`, `/api/csrf-token` e estáticos. Limites apertados ficam em autenticação (`/auth/login` 5/min, `/auth/callback` 10/min, `/auth/dev-login` 5/min) e nas rotas de escrita. |
+| **Proxy reverso** | `ProxyFix` com `TRUSTED_PROXY_COUNT` (padrão 1, o do Azure). Sem isso `remote_addr` era o IP do balanceador — todos os usuários dividiam o mesmo balde de rate limit — e `url_for(_external=True)` gerava `http://` em vez de `https://`. |
+| **CORS / redirect** | `FRONTEND_ORIGINS`, `APP_BASE_URL` e `POST_LOGIN_PATH` vêm de env. O caminho do redirect é sanitizado (`internal_path`) contra open redirect (`//evil.com`, URL absoluta). |
+| **Debug** | `app.run(debug=True)` com bind `0.0.0.0` expunha o console do Werkzeug (RCE). Debug agora é opt-in via `FLASK_DEBUG` e nunca liga por padrão. |
+| **Import sem efeitos colaterais** | `backend` não cria mais o app no import: o Alembic (`from backend import Base`) deixava de abrir conexão/`create_all()`, e o `wsgi.py` não inicializa tudo duas vezes. |
+
+### Ainda pendente (Fases 3–4)
+- **Dinheiro em `Float`** e `amount` negativo/zero aceito no `POST` de transações (o `PUT` valida `> 0`).
+- **Parcelas contadas para sempre** no summary: `expenses_parcelas` soma `monthly_value` de todas as parcelas, ignorando `total_months` e o tempo decorrido.
+- **Dedup da sync ignora soft-deleted**: transação apagada volta na próxima sincronização.
+- **Fallback silencioso para `sqlite:///:memory:`** quando o engine falha.
+- **Migrações Alembic vazias** (`upgrade(): pass`) e específicas de SQLite (`sqlite_master`), com `alembic.ini` ignorando `DATABASE_URL`.
+- **Fase 4**: quebrar `create_app()` (~1.400 linhas) em blueprints, remover código morto (`open_finance.py`, `LogContext`), agregações em SQL no summary/suggestions e reescrever as seções desatualizadas deste README.
+
+## Rate limiting
+
+| Rota | Limite |
+|------|--------|
+| `/auth/login` | 5/min |
+| `/auth/callback` | 10/min |
+| `/auth/dev-login` | 5/min |
+| `/api/users/<id>/openfinance/sync` | 10/hora |
+| `/api/users/<id>/openfinance/consents` (POST) | 20/hora |
+| `/api/users/<id>/import` | 20/hora |
+| `/api/users/<id>/suggestions` | 50/hora |
+| `/api/users/<id>/investments/portfolio` | 50/hora |
+| `/api/investments/tips` | 50/hora |
+| `/api/openfinance/webhook` | 100/hora |
+| escritas de transações/parcelas/investimentos | 100/hora |
+| qualquer outra rota | 500/hora e 5000/dia |
+| `/api/health`, `/`, `/api/csrf-token`, `/static/*` | isentas |
+
+Contagem por IP real do cliente (via `ProxyFix`). Com `RATELIMIT_STORAGE_URI=memory://`
+cada instância conta separadamente — aponte para Redis ao escalar horizontalmente.
+Resposta ao exceder: `429`.
 
 ## Validação & Erros
 Erros retornam JSON:
@@ -274,17 +393,34 @@ Erros retornam JSON:
 ```
 
 ## Limitações Atuais
-- Sem autenticação real no backend.
-- Frontend ainda usa Firestore; para integrar totalmente com a API seria necessário substituir chamadas por fetch aos endpoints.
-- Sem paginação (adequado apenas para volume pequeno de registros).
+- **Não há frontend neste repositório**: `static/` está vazio, então o redirect
+  pós-login (`POST_LOGIN_PATH`) aponta para um arquivo que ainda não existe.
+- `amount` é armazenado como `Float` e o `POST` de transações aceita valor
+  negativo/zero (o `PUT` valida `> 0`) — o summary pode ficar invertido.
+- O summary soma `monthly_value` de **todas** as parcelas, ignorando
+  `total_months` e o tempo decorrido: parcela quitada continua contando como
+  despesa mensal.
+- Listagens têm paginação, mas transações não têm filtro por período/tipo
+  (investimentos filtram por `status` e `asset_type`).
+- Agregações (summary, suggestions, portfolio) somam em Python sobre todas as
+  linhas do usuário, não em SQL.
+- Migrações Alembic são no-op e específicas de SQLite; quem cria o schema é o
+  `create_all()` no boot.
 
 ## Próximos Passos Sugeridos
-1. Autenticação JWT/OAuth e derivar `user_id` automaticamente.
-2. Paginação e filtros (por data / tipo) em transações.
-3. Marcar parcelas concluídas (reduzir `total_months`).
-4. Exportação CSV / Excel.
-5. Testes automatizados (Pytest) para endpoints críticos.
-6. Rate limiting e logging estruturado (JSON) para produção.
+1. ~~Autenticação OAuth e derivar `user_id` da sessão~~ — **feito**
+2. ~~Paginação~~ — **feito** · filtros por data/tipo em transações — pendente
+3. Marcar parcelas concluídas e considerá-las corretamente no summary
+4. Exportação CSV / Excel
+5. ~~Testes automatizados~~ — **61 testes** (Fases 1 e 2); ampliar para
+   summary, suggestions e portfolio
+6. ~~Rate limiting e logging estruturado (JSON)~~ — **feito**
+7. `Numeric(14,2)` para valores monetários + migração dos dados existentes
+8. Alembic real (schema inicial portável, lendo `DATABASE_URL`) e remover o
+   `create_all()` do boot
+9. Blueprints + camada de serviço (`create_app()` tem ~1.400 linhas)
+10. Publicar o frontend em `static/`
+11. Redis como `RATELIMIT_STORAGE_URI` ao escalar para mais de uma instância
 
 ## Licença
 Uso interno / educacional.
