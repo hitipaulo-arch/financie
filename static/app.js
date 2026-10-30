@@ -159,6 +159,58 @@ function mostrarLogin() {
   state.user = null;
   $('#app').classList.add('oculto');
   $('#tela-login').classList.remove('oculto');
+  aplicarMetodosDeLogin();
+}
+
+/**
+ * Descobre o que este servidor oferece de entrada e mostra só o que funciona.
+ *
+ * Sem isso a tela exibia sempre o botão do Google (que responde 500 quando
+ * GOOGLE_CLIENT_ID/SECRET não existem) e escondia o login sem Google dentro de um
+ * <details> — justamente o caminho que funciona em ambiente de teste.
+ */
+async function aplicarMetodosDeLogin() {
+  const google = $('#btn-google');
+  const painel = $('#painel-dev-login');
+  const alvoErro = $('#login-erro');
+  const alvoAviso = $('#login-aviso');
+
+  let metodos = null;
+  try {
+    const resp = await fetch('/auth/methods', { credentials: 'include' });
+    if (resp.ok) metodos = await resp.json();
+  } catch {
+    metodos = null;
+  }
+
+  if (!metodos) {
+    // Não deu para consultar: mostra o caminho padrão em vez de deixar a pessoa
+    // presa numa tela sem nenhuma saída.
+    google.classList.remove('oculto');
+    return;
+  }
+
+  google.classList.toggle('oculto', !metodos.google);
+  painel.classList.toggle('oculto', !metodos.dev_login);
+
+  if (metodos.dev_login) {
+    alvoAviso.textContent = metodos.google
+      ? 'Você também pode entrar com Google; o acesso sem conta usa apenas um nome de usuário.'
+      : 'Este servidor não tem Google configurado — entre com um nome de usuário abaixo.';
+    alvoAviso.classList.remove('oculto');
+    // Enter no campo também entra.
+    $('#dev-user').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); devLogin(); }
+    });
+  }
+
+  if (!metodos.google && !metodos.dev_login) {
+    alvoErro.textContent =
+      'Nenhuma forma de entrada está habilitada neste servidor. '
+      + 'Configure GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET, '
+      + 'ou ENABLE_DEV_LOGIN=true fora de produção.';
+    alvoErro.classList.remove('oculto');
+  }
 }
 
 function mostrarApp() {
@@ -827,6 +879,7 @@ async function logout() {
 
 async function devLogin() {
   const alvoErro = $('#login-erro');
+  const alvoAviso = $('#login-aviso');
   alvoErro.classList.add('oculto');
   const botao = $('#btn-dev-login');
   botao.disabled = true;
@@ -840,7 +893,36 @@ async function devLogin() {
       body: JSON.stringify({ user_id: $('#dev-user').value.trim() || 'dev' }),
     });
     const corpo = await resp.json().catch(() => null);
+
+    if (resp.status === 429) {
+      // O servidor devolve details "5 per minute", que não diz nada para quem
+      // só clicou duas vezes no botão.
+      alvoErro.textContent =
+        'Muitas tentativas seguidas: aguarde 1 minuto e clique de novo. '
+        + 'Se você já entrou antes nesta aba, a sessão pode estar ativa — recarregue a página.';
+      alvoErro.classList.remove('oculto');
+      return;
+    }
     if (!resp.ok) throw new ErroApi(resp.status, corpo);
+
+    // O servidor aceitou (200) e mandou o cookie. Falta saber se o navegador vai
+    // devolvê-lo: quando a página roda dentro de um iframe de outro domínio e
+    // cookies de terceiros estão bloqueados, o login "funciona" e a tela volta
+    // para cá sem explicação. Confere antes de trocar de tela e diz o que fazer.
+    const confere = await fetch('/auth/me', { credentials: 'include' });
+    if (!confere.ok) {
+      alvoErro.textContent =
+        'O servidor aceitou o login, mas o navegador não devolveu o cookie de sessão. '
+        + 'Isso acontece quando a página está aberta dentro de um quadro (iframe) de outro site '
+        + 'e o navegador bloqueia cookies de terceiros.';
+      alvoAviso.textContent =
+        'Como resolver: abra esta aplicação em uma aba própria do navegador '
+        + '(botão direito no preview → "abrir em nova aba") e entre por lá.';
+      alvoAviso.classList.remove('oculto');
+      return;
+    }
+
+    alvoAviso.classList.add('oculto');
     await iniciar();
   } catch (erro) {
     alvoErro.textContent = erro.message;

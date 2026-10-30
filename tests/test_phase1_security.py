@@ -40,7 +40,7 @@ BASE_ENV = {
 # aplicar o cenário do teste — sem isso um teste vaza configuração para o
 # seguinte (o módulo resolve as flags no import).
 APP_ENV_VARS = [
-    "APP_ENV", "ENABLE_DEV_LOGIN", "WEBSITE_SITE_NAME",
+    "APP_ENV", "ENABLE_DEV_LOGIN", "WEBSITE_SITE_NAME", "DEV_LOGIN_RATE_LIMIT",
     "OPENFINANCE_ENABLE_REAL", "OPENFINANCE_WEBHOOK_SECRET",
     "OPENFINANCE_BASE_URL", "OPENFINANCE_CLIENT_ID", "OPENFINANCE_CLIENT_SECRET",
     "OPENFINANCE_CERT_PATH", "OPENFINANCE_KEY_PATH",

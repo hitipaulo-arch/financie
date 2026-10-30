@@ -14,21 +14,31 @@
     <div class="cartao-login">
       <h1>Gestor Financeiro</h1>
       <p class="subtitulo">Controle de receitas, despesas, parcelas e investimentos.</p>
-      <a id="btn-google" class="botao botao-primario botao-largo" href="/auth/login">
+
+      <!-- Revelado só se GOOGLE_CLIENT_ID/SECRET estiverem configurados.
+           Começa oculto para não piscar um botão que este servidor não oferece. -->
+      <a id="btn-google" class="botao botao-primario botao-largo oculto" href="/auth/login">
         Entrar com Google
       </a>
 
-      <details class="dev-login">
-        <summary>Entrar sem Google (apenas desenvolvimento)</summary>
-        <p class="dica">
-          Disponível somente com <code>ENABLE_DEV_LOGIN=true</code> fora de produção.
-          Em produção responde <code>403 dev_login_disabled</code>.
+      <!-- Login sem Google. Antes vivia escondido num <details> rotulado
+           "apenas desenvolvimento": quem precisava entrar não achava. Agora é um
+           painel de primeira classe, mostrado quando /auth/methods confirma que
+           está liberado neste ambiente. -->
+      <div id="painel-dev-login" class="dev-login oculto">
+        <h2 id="titulo-dev-login">Entrar sem Google</h2>
+        <p class="dica" id="dica-dev-login">
+          Escolha um nome de usuário. Ele identifica seus dados e fica salvo só na
+          sua sessão — não existe senha.
         </p>
-        <input id="dev-user" type="text" placeholder="user_id" value="dev">
-        <button id="btn-dev-login" class="botao botao-secundario">Entrar como dev</button>
-      </details>
+        <label class="rotulo" for="dev-user">Usuário</label>
+        <input id="dev-user" type="text" placeholder="ex.: maria" value="dev"
+               autocomplete="username" spellcheck="false">
+        <button id="btn-dev-login" class="botao botao-secundario botao-largo">Entrar</button>
+      </div>
 
       <p id="login-erro" class="erro oculto"></p>
+      <p id="login-aviso" class="dica oculto"></p>
     </div>
   </section>
 

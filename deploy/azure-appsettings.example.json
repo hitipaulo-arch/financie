@@ -20,6 +20,7 @@
   "WTF_CSRF_SSL_STRICT": "true",
 
   "ENABLE_DEV_LOGIN": "false",
+  "DEV_LOGIN_RATE_LIMIT": "5 per minute",
   "FLASK_DEBUG": "false",
   "RATELIMIT_ENABLED": "true",
   "RATELIMIT_STORAGE_URI": "memory://",

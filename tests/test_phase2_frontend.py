@@ -280,3 +280,133 @@ def test_frontend_funciona_sem_dev_login_usando_sessao_injetada(app_env):
         "description": "Aluguel", "amount": 1800, "type": "expense",
     }, headers=h).status_code == 201
     assert c.get("/api/users/prod-user/summary").get_json()["expenses_avulsa"] == 1800
+
+
+# ---------------------------------------------------------------------------
+# Entrar sem a conta do Google
+# ---------------------------------------------------------------------------
+def test_auth_methods_e_publico_e_anuncia_o_dev_login(app_env):
+    """A tela de login precisa saber o que o servidor oferece — e sem ter sessão."""
+    _, app = app_env
+    resp = app.test_client().get("/auth/methods")
+    assert resp.status_code == 200, resp.get_data(as_text=True)[:150]
+    corpo = resp.get_json()
+    assert corpo["dev_login"] is True, "dev-login habilitado precisa ser anunciado"
+    assert corpo["producao"] is False
+    assert isinstance(corpo["google"], bool)
+
+
+def test_auth_methods_nao_anuncia_dev_login_em_producao(tmp_path):
+    """Anunciar uma entrada que responde 403 só serve para levar o usuário ao erro.
+
+    `ENABLE_DEV_LOGIN=true` é ignorado em produção desde a Fase 1; o anúncio tem
+    que respeitar isso, senão a tela mostra um botão morto.
+    """
+    _, app = build_app({
+        "GF_DB_URL": f"sqlite:///{tmp_path / 'producao.db'}",
+        "APP_ENV": "production",
+        "ENABLE_DEV_LOGIN": "true",
+    })
+    app.config["TESTING"] = False
+    corpo = app.test_client().get("/auth/methods").get_json()
+    assert corpo["dev_login"] is False
+    assert corpo["producao"] is True
+
+
+def test_auth_methods_anuncia_google_so_quando_configurado(tmp_path):
+    _, sem = build_app({
+        "GF_DB_URL": f"sqlite:///{tmp_path / 'sem_google.db'}",
+        "APP_ENV": "development",
+    })
+    sem.config["TESTING"] = False
+    assert sem.test_client().get("/auth/methods").get_json()["google"] is False
+
+    _, com = build_app({
+        "GF_DB_URL": f"sqlite:///{tmp_path / 'com_google.db'}",
+        "APP_ENV": "development",
+        "GOOGLE_CLIENT_ID": "1234.apps.googleusercontent.com",
+        "GOOGLE_CLIENT_SECRET": "segredo",
+    })
+    com.config["TESTING"] = False
+    assert com.test_client().get("/auth/methods").get_json()["google"] is True
+
+
+def test_dev_login_funciona_sem_google_e_da_acesso_aos_dados(app_env):
+    """O caminho completo de quem não tem conta do Google configurada."""
+    _, app = app_env
+    c = app.test_client()
+    resp = c.post("/auth/dev-login", json={"user_id": "maria"})
+    assert resp.status_code == 200, resp.get_data(as_text=True)[:150]
+    assert c.get("/auth/me").get_json()["user_id"] == "maria"
+    # e a sessão dá acesso às APIs do próprio usuário
+    assert c.get("/api/users/maria/summary").status_code == 200
+    assert c.get("/api/users/outra/summary").status_code in (401, 403, 404)
+
+
+def test_limite_do_dev_login_e_configuravel(tmp_path):
+    """5/min trava quem clica duas vezes e recarrega a página; precisa dar para subir.
+
+    O padrão continua sendo proteção contra força bruta — este teste garante que
+    a proteção existe E que é ajustável por ambiente.
+    """
+    _, padrao = build_app({
+        "GF_DB_URL": f"sqlite:///{tmp_path / 'limite_padrao.db'}",
+        "APP_ENV": "development",
+        "ENABLE_DEV_LOGIN": "true",
+    })
+    padrao.config["TESTING"] = False
+    codigos = [padrao.test_client().post("/auth/dev-login", json={"user_id": "u"}).status_code
+               for _ in range(8)]
+    assert 429 in codigos, f"o padrão deveria limitar: {codigos}"
+    assert codigos[0] == 200
+
+    _, folgado = build_app({
+        "GF_DB_URL": f"sqlite:///{tmp_path / 'limite_folgado.db'}",
+        "APP_ENV": "development",
+        "ENABLE_DEV_LOGIN": "true",
+        "DEV_LOGIN_RATE_LIMIT": "60 per minute",
+    })
+    folgado.config["TESTING"] = False
+    codigos = [folgado.test_client().post("/auth/dev-login", json={"user_id": "u"}).status_code
+               for _ in range(20)]
+    assert 429 not in codigos, f"DEV_LOGIN_RATE_LIMIT não foi respeitado: {codigos}"
+
+
+def test_o_login_sem_google_nao_fica_mais_escondido():
+    """Regressão: a única entrada viável em teste estava dentro de um <details>.
+
+    Fechado por padrão e rotulado "apenas desenvolvimento", ninguém achava — e o
+    botão do Google, que nesse ambiente responde 500, era o que aparecia.
+    """
+    html = ler("index.html")
+    assert "<details class=\"dev-login\">" not in html, (
+        "o painel de login sem Google voltou a ficar recolhido"
+    )
+    assert 'id="painel-dev-login"' in html
+    assert 'id="btn-google"' in html
+    # os dois começam ocultos: quem decide o que mostrar é /auth/methods
+    for id_ in ("btn-google", "painel-dev-login"):
+        bloco = re.search(rf'<(?:a|div)[^>]*id="{id_}"[^>]*>', html).group(0)
+        assert "oculto" in bloco, f"{id_} deve começar oculto e ser revelado por /auth/methods"
+
+
+def test_frontend_consulta_os_metodos_de_login():
+    js = ler("app.js")
+    assert "/auth/methods" in js, "o frontend precisa perguntar o que está habilitado"
+    assert "aplicarMetodosDeLogin" in js
+
+
+def test_frontend_confere_se_a_sessao_grudou_apos_o_login():
+    """Cookie de terceiro bloqueado em iframe faz o login 'funcionar' e não entrar.
+
+    Sem a conferência a tela voltava para o login em silêncio; agora explica o que
+    aconteceu e manda abrir em aba própria.
+    """
+    js = ler("app.js")
+    corpo = js[js.index("async function devLogin"):]
+    corpo = corpo[:corpo.index("\n}\n")]
+    assert "'/auth/me'" in corpo or '"/auth/me"' in corpo, (
+        "devLogin precisa confirmar a sessão depois do 200"
+    )
+    assert "iframe" in corpo.lower(), "a mensagem precisa citar o quadro/iframe"
+    assert "429" in corpo, "o 429 do rate limit precisa ter mensagem própria"

@@ -89,6 +89,12 @@ IS_PRODUCTION = APP_ENV in ("production", "prod") or bool(os.getenv("WEBSITE_SIT
 # qualquer user_id. Agora exige opt-in explícito E ambiente não-produtivo.
 DEV_LOGIN_ENABLED = env_flag("ENABLE_DEV_LOGIN") and not IS_PRODUCTION
 
+# Ritmo do dev-login. O padrão (5/min) é proteção contra força bruta, mas numa
+# interface gráfica isso estoura com dois cliques e um F5 — e o usuário fica
+# trancado por um minuto achando que o login "não funciona". Configurável para
+# ambientes de demonstração/teste, onde o dev-login é o único jeito de entrar.
+DEV_LOGIN_RATE_LIMIT = os.getenv("DEV_LOGIN_RATE_LIMIT", "5 per minute")
+
 # ---------------------------------------------------------------------------
 # URLs públicas, CORS e proxy reverso
 # ---------------------------------------------------------------------------
@@ -789,6 +795,23 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     # Autenticação Google OAuth
     # -------------------------------------------------------------------
+    @app.route("/auth/methods")
+    @limiter.exempt  # consultado a cada carga de página, antes de haver sessão
+    def auth_methods():
+        """Quais formas de entrar estão disponíveis.
+
+        Sem isso o frontend não tem como saber se deve oferecer o login sem
+        Google: ele ou mostrava o botão escondido num `<details>` (e o usuário
+        não achava), ou tentava e levava `403 dev_login_disabled` sem entender.
+        Público de propósito — não revela segredo nenhum: diz apenas se o OAuth
+        está configurado e se o dev-login está liberado neste ambiente.
+        """
+        return jsonify({
+            "google": bool(google),
+            "dev_login": bool(app.config.get("TESTING") or DEV_LOGIN_ENABLED),
+            "producao": IS_PRODUCTION,
+        }), 200
+
     @app.route("/auth/login")
     @limiter.limit("5 per minute")  # CRITICAL: Protege contra brute force
     def login():
@@ -853,7 +876,7 @@ def create_app() -> Flask:
 
     @app.route("/auth/dev-login", methods=['POST'])
     @csrf.exempt  # isenção documentada: existe só fora de produção e o chamador ainda não tem sessão/token
-    @limiter.limit("5 per minute")  # é um endpoint de login: limita tentativa em força bruta
+    @limiter.limit(DEV_LOGIN_RATE_LIMIT)  # é um endpoint de login: limita tentativa em força bruta
     def dev_login():
         """
         Endpoint de login para desenvolvimento (SEM OAuth).

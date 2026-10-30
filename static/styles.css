@@ -63,7 +63,10 @@ body {
 }
 
 .dev-login summary { cursor: pointer; color: var(--texto-suave); font-size: .9rem; }
-.dev-login input { margin: 12px 0 8px; width: 100%; }
+.dev-login input { margin: 4px 0 12px; width: 100%; }
+.dev-login h2 { font-size: 1rem; margin-bottom: 6px; }
+.dev-login .dica { margin-bottom: 12px; }
+.dev-login .rotulo { display: block; margin-bottom: 2px; }
 
 /* --------------------------------------------------------------------------
    Botões
