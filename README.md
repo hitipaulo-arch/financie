@@ -42,7 +42,10 @@ python3 -m venv .venv
 4. Clique **Create Credentials > OAuth 2.0 Client ID**
 5. Configure a tela de consentimento se necessário
 6. Tipo de aplicação: **Web application**
-7. Authorized redirect URIs: `http://localhost:5000/auth/callback`
+7. Authorized redirect URIs: `http://localhost:8000/auth/callback`
+   (é a porta dos launchers `run.sh` / `start_backend.bat`. Se for rodar
+   `python backend.py` à mão, o default é `5000` — cadastre as duas se usar
+   ambos os caminhos.)
 8. Copie **Client ID** e **Client Secret**
 
 ### 2. Configurar Variáveis de Ambiente
@@ -89,34 +92,61 @@ segunda vez em diante só sobem o servidor:
    chave fixa o backend gera uma aleatória a cada start e registra `CRITICAL`:
    sessão e token CSRF morrem em todo restart.
 5. Rodam `alembic upgrade head`.
-6. Sobem o servidor em **`http://127.0.0.1:5000`**.
+6. Sobem o servidor em **`http://localhost:8000`** e **abrem o navegador** assim
+   que a porta responde (o bind é em `0.0.0.0`, então outros aparelhos na mesma
+   rede acessam pelo IP local, que o script também imprime).
 
 | Opção | Efeito |
 |---|---|
-| `--port 8080` | muda a porta (padrão `5000`) |
-| `--host 0.0.0.0` | muda o bind (padrão `127.0.0.1`) |
+| `--port 8080` | muda a porta (padrão `8000`) |
+| `--host 127.0.0.1` | restringe a esta máquina (padrão `0.0.0.0`) |
+| `--no-browser` | não abre o navegador |
+| `--browser` | abre mesmo com a saída redirecionada (só `run.sh`) |
 | `--reinstall` | força a reinstalação das dependências |
 | `--no-migrate` | pula o `alembic upgrade head` |
 | `--help` | imprime o resumo |
 
 Precedência das variáveis, da mais forte para a mais fraca: **o seu ambiente →
 o `.env` → o padrão do script**. Definir `PORT` no shell e rodar sem `--port`
-respeita o seu `PORT`.
+respeita o seu `PORT`. Host e porta são exceção: vêm sempre da linha de comando
+ou do padrão do script, nunca do `.env`.
 
-> **`127.0.0.1` e não `0.0.0.0` é deliberado.** O default do `backend.py` é
-> `0.0.0.0`, o que exporia na rede local um servidor com `ENABLE_DEV_LOGIN=true`
-> — e esse endpoint permite assumir a sessão de qualquer `user_id`. Passe
-> `--host 0.0.0.0` conscientemente se precisar.
+> ⚠️ **O padrão `0.0.0.0` expõe o servidor na rede local, e este launcher liga
+> `ENABLE_DEV_LOGIN=true`.** Qualquer aparelho na mesma rede pode chamar
+> `POST /auth/dev-login` e assumir a sessão de **qualquer** `user_id` — inclusive
+> o `sub` do Google de uma pessoa real — e ler/alterar os dados financeiros dela.
+> Foi uma escolha explícita para poder testar de outro aparelho; os scripts
+> imprimem este aviso a cada execução. Para fechar: `--host 127.0.0.1`, ou
+> `ENABLE_DEV_LOGIN=false` no `.env`. **Nunca faça isso numa rede em que você não
+> confia em todos os aparelhos.**
 
-> **O bind em loopback também explica por que o launcher não serve para o
-> preview/produção.** Nesses casos o bind precisa ser `0.0.0.0` e o servidor é o
-> gunicorn — veja `startup.txt` e `deploy/README.md`.
+> **`http://0.0.0.0:8000` não é impresso nem aberto em lugar nenhum.** `0.0.0.0`
+> é endereço de *bind*, não de destino: no Windows o navegador nem o resolve. O
+> que se imprime e se abre é `localhost`, mais o IP da interface de saída quando
+> o bind é aberto.
+
+> **Porta 8000, e não 5000.** É a do `startup.txt` (gunicorn binda
+> `0.0.0.0:8000`), a que o Azure App Service espera e a deste servidor de teste.
+> Desenvolver na mesma porta da produção evita a classe de surpresa "funciona
+> aqui, falha lá". Note que o default do próprio `backend.py` continua `5000` —
+> quem roda `python backend.py` à mão pega 5000; os launchers exportam `PORT`.
+
+> **Abrir o navegador é feito por `scripts/abrir_navegador.py`, num processo à
+> parte.** O `run.sh` termina em `exec python backend.py`, que substitui o shell:
+> não sobraria nada para abrir o navegador depois. E abrir antes dá "não foi
+> possível conectar", porque o socket ainda não está escutando — por isso o
+> auxiliar sonda a porta (até ~60 s) antes de chamar `webbrowser.open()`. O
+> `run.sh` só abre quando a saída é um terminal; o `.bat` abre sempre, já que
+> nunca roda em CI.
 
 ### Jeito longo: à mão
 
 ```bash
 APP_ENV=development ENABLE_DEV_LOGIN=true .venv/bin/python backend.py
 ```
+
+Sobe em `http://localhost:5000` (default do `backend.py`, que os launchers
+sobrescrevem para 8000).
 
 Sem `APP_ENV` o backend assume **produção** (fail-closed): o dev-login é
 desativado e o cookie de sessão sai marcado como `Secure`. É por isso que os
@@ -458,7 +488,7 @@ Sem token a resposta é `400`:
 
 ## Exemplos `curl`
 ```bash
-BASE=http://localhost:5000
+BASE=http://localhost:8000   # porta dos launchers; `python backend.py` à mão usa 5000
 JAR=/tmp/cookies.txt
 
 # 0) autenticar (apenas em desenvolvimento, com ENABLE_DEV_LOGIN=true)

@@ -3,11 +3,12 @@ rem ---------------------------------------------------------------------------
 rem Sobe o Gestor Financeiro para desenvolvimento local (Windows).
 rem Em Linux/macOS/WSL use ./run.sh, que faz exatamente o mesmo.
 rem
-rem   start_backend.bat                 cria o venv se preciso, instala, migra, serve
-rem   start_backend.bat --port 8080     muda a porta            (padrao: 5000)
-rem   start_backend.bat --host 0.0.0.0  muda o bind             (padrao: 127.0.0.1)
-rem   start_backend.bat --reinstall     forca reinstalar as dependencias
-rem   start_backend.bat --no-migrate    pula o "alembic upgrade head"
+rem   start_backend.bat                  cria o venv se preciso, instala, migra, serve
+rem   start_backend.bat --port 8080      muda a porta            (padrao: 8000)
+rem   start_backend.bat --host 127.0.0.1 so para esta maquina    (padrao: 0.0.0.0)
+rem   start_backend.bat --no-browser     nao abre o navegador automaticamente
+rem   start_backend.bat --reinstall      forca reinstalar as dependencias
+rem   start_backend.bat --no-migrate     pula o "alembic upgrade head"
 rem   start_backend.bat --help
 rem
 rem DUAS REGRAS DE MANUTENCAO, aprendidas do jeito dificil:
@@ -23,12 +24,19 @@ rem ---------------------------------------------------------------------------
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
-set "PORTA=5000"
+rem Porta 8000 de proposito: e a do startup.txt (gunicorn binda 0.0.0.0:8000),
+rem a que o Azure App Service espera. Desenvolver na mesma porta da producao
+rem evita a classe de surpresa "funciona aqui, falha la".
+set "PORTA=8000"
 if defined PORT set "PORTA=!PORT!"
-set "HOST=127.0.0.1"
+rem 0.0.0.0 atende o pedido de acessar de outros aparelhos na rede. O preco e
+rem dito em voz alta na hora de subir: com ENABLE_DEV_LOGIN=true qualquer pessoa
+rem na mesma rede entra sem autenticacao. --host 127.0.0.1 fecha isso.
+set "HOST=0.0.0.0"
 if defined FLASK_RUN_HOST set "HOST=!FLASK_RUN_HOST!"
 set "REINSTALL=0"
 set "MIGRAR=1"
+set "ABRIR=1"
 set "VENV=.venv"
 set "VPY=.venv\Scripts\python.exe"
 set "CARIMBO=.venv/.requirements-sha256"
@@ -48,6 +56,8 @@ if /i "%~1"=="--port" goto arg_port
 if /i "%~1"=="--host" goto arg_host
 if /i "%~1"=="--reinstall" goto arg_reinstall
 if /i "%~1"=="--no-migrate" goto arg_no_migrate
+if /i "%~1"=="--no-browser" goto arg_no_browser
+if /i "%~1"=="--browser" goto arg_browser
 if /i "%~1"=="--help" goto ajuda
 if /i "%~1"=="-h" goto ajuda
 set "MOTIVO=opcao desconhecida: %~1"
@@ -80,6 +90,16 @@ goto args
 
 :arg_no_migrate
 set "MIGRAR=0"
+shift
+goto args
+
+:arg_no_browser
+set "ABRIR=0"
+shift
+goto args
+
+:arg_browser
+set "ABRIR=1"
 shift
 goto args
 
@@ -219,7 +239,59 @@ echo        com a aplicacao configurada para PRODUCAO. Em producao use
 echo        gunicorn: veja startup.txt e deploy/README.md.
 
 :servir
-echo ==^> servidor em http://!HOST!:!PORTA!  -  Ctrl+C para parar
+rem 0.0.0.0 e endereco de bind, nao de destino: no Windows nem abre no
+rem navegador. Por isso o que se imprime (e o que se abre) e sempre localhost.
+echo ==^> servidor em http://localhost:!PORTA!  -  Ctrl+C para parar
+
+set "LOOPBACK=0"
+if "!HOST!"=="127.0.0.1" set "LOOPBACK=1"
+if /i "!HOST!"=="localhost" set "LOOPBACK=1"
+if "!HOST!"=="::1" set "LOOPBACK=1"
+if "!LOOPBACK!"=="1" goto abrir
+
+rem IP que os outros aparelhos da rede vao usar. O truque do socket UDP descobre
+rem a interface de saida sem enviar pacote nenhum. Se nao houver rota, o Python
+rem sai com erro e a linha simplesmente nao e impressa.
+set "RESPOSTA=%TEMP%\gf_rede_%RANDOM%.tmp"
+set "IP_REDE="
+"%VPY%" -c "import socket,sys,pathlib;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));pathlib.Path(sys.argv[1]).write_text(s.getsockname()[0])" "!RESPOSTA!"
+set "FALHOU=0"
+if errorlevel 1 set "FALHOU=1"
+if exist "!RESPOSTA!" set /p IP_REDE=<"!RESPOSTA!"
+del "!RESPOSTA!" >nul 2>&1
+if "!FALHOU!"=="1" goto aviso_dev
+if "!IP_REDE!"=="" goto aviso_dev
+echo ==^> na rede local: http://!IP_REDE!:!PORTA!
+
+:aviso_dev
+rem Espelha env_flag() do backend (1/true/yes/on). Pelo mesmo motivo de
+rem EM_PRODUCAO: quem le o .env e o Python, nunca este shell.
+set "RESPOSTA=%TEMP%\gf_devlogin_%RANDOM%.tmp"
+set "DEV_LOGIN=0"
+"%VPY%" -c "import os,sys,pathlib;from dotenv import load_dotenv;load_dotenv();v=(os.getenv('ENABLE_DEV_LOGIN') or 'false').strip().lower();pathlib.Path(sys.argv[1]).write_text('1' if v in ('1','true','yes','on') else '0')" "!RESPOSTA!"
+set "FALHOU=0"
+if errorlevel 1 set "FALHOU=1"
+if exist "!RESPOSTA!" set /p DEV_LOGIN=<"!RESPOSTA!"
+del "!RESPOSTA!" >nul 2>&1
+if "!FALHOU!"=="1" goto abrir
+if not "!DEV_LOGIN!"=="1" goto abrir
+echo.
+echo AVISO: bind em !HOST! com ENABLE_DEV_LOGIN=true.
+echo        Qualquer aparelho na mesma rede pode entrar sem autenticacao e
+echo        assumir a sessao de qualquer user_id, inclusive o de outra pessoa.
+echo        Para fechar:  start_backend.bat --host 127.0.0.1
+echo        Ou no .env:   ENABLE_DEV_LOGIN=false
+echo.
+
+:abrir
+if not "!ABRIR!"=="1" goto rodar
+echo ==^> abrindo o navegador assim que a porta responder
+rem Processo a parte: o servidor abaixo toma o primeiro plano, entao nao
+rem sobraria nada para abrir o navegador depois - e abrir antes da "nao foi
+rem possivel conectar", porque o socket ainda nao esta escutando.
+start "" /min "%VPY%" scripts\abrir_navegador.py !PORTA! localhost
+
+:rodar
 "%VPY%" backend.py
 set "CODIGO=!ERRORLEVEL!"
 if "!INTERATIVO!"=="1" pause
@@ -242,14 +314,19 @@ exit /b 0
 echo.
 echo Sobe o Gestor Financeiro para desenvolvimento local.
 echo.
-echo   start_backend.bat                 cria o venv se preciso, instala, migra, serve
-echo   start_backend.bat --port 8080     muda a porta            [padrao: 5000]
-echo   start_backend.bat --host 0.0.0.0  muda o bind             [padrao: 127.0.0.1]
-echo   start_backend.bat --reinstall     forca reinstalar as dependencias
-echo   start_backend.bat --no-migrate    pula o "alembic upgrade head"
+echo   start_backend.bat                  cria o venv se preciso, instala, migra, serve
+echo   start_backend.bat --port 8080      muda a porta            [padrao: 8000]
+echo   start_backend.bat --host 127.0.0.1 so para esta maquina    [padrao: 0.0.0.0]
+echo   start_backend.bat --no-browser     nao abre o navegador automaticamente
+echo   start_backend.bat --reinstall      forca reinstalar as dependencias
+echo   start_backend.bat --no-migrate     pula o "alembic upgrade head"
 echo.
 echo Precedencia: ambiente, depois .env, depois o padrao deste script.
 echo Producao: gunicorn - veja startup.txt e deploy/README.md.
+echo.
+echo ATENCAO: o padrao 0.0.0.0 abre o servidor para a rede local, e este
+echo launcher liga ENABLE_DEV_LOGIN=true. Qualquer aparelho na mesma rede
+echo entra sem autenticacao. Use --host 127.0.0.1 para fechar.
 echo.
 if "!INTERATIVO!"=="1" pause
 exit /b 0

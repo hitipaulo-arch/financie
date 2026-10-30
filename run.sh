@@ -3,11 +3,13 @@
 # Sobe o Gestor Financeiro para desenvolvimento local (Linux / macOS / WSL).
 # No Windows use start_backend.bat, que faz exatamente o mesmo.
 #
-#   ./run.sh                 cria o venv se preciso, instala, migra e serve
-#   ./run.sh --port 8080     muda a porta            (padrão: 5000)
-#   ./run.sh --host 0.0.0.0  muda o bind             (padrão: 127.0.0.1)
-#   ./run.sh --reinstall     força reinstalar as dependências
-#   ./run.sh --no-migrate    pula o `alembic upgrade head`
+#   ./run.sh                  cria o venv se preciso, instala, migra e serve
+#   ./run.sh --port 8080      muda a porta            (padrão: 8000)
+#   ./run.sh --host 127.0.0.1 só para esta máquina    (padrão: 0.0.0.0, abre p/ a rede)
+#   ./run.sh --no-browser     não abre o navegador automaticamente
+#   ./run.sh --browser        abre mesmo com a saída redirecionada
+#   ./run.sh --reinstall      força reinstalar as dependências
+#   ./run.sh --no-migrate     pula o `alembic upgrade head`
 #   ./run.sh --help
 #
 # Idempotente: da segunda vez em diante só sobe o servidor.
@@ -19,10 +21,17 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PORTA="${PORT:-5000}"
-HOST="${FLASK_RUN_HOST:-127.0.0.1}"
+# Porta 8000 de propósito: é a do startup.txt (gunicorn binda 0.0.0.0:8000), a
+# que o Azure App Service espera e a deste servidor de teste. Desenvolver na
+# mesma porta da produção evita a classe de surpresa "funciona aqui, falha lá".
+PORTA="${PORT:-8000}"
+# 0.0.0.0 atende o pedido de acessar de outros aparelhos na rede. O preço está
+# dito em voz alta na hora de subir: com ENABLE_DEV_LOGIN=true qualquer pessoa na
+# mesma rede entra sem autenticação. --host 127.0.0.1 fecha isso.
+HOST="${FLASK_RUN_HOST:-0.0.0.0}"
 REINSTALL=0
 MIGRAR=1
+ABRIR=auto   # auto = só se a saída for um terminal | sim | nao
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -30,6 +39,8 @@ while [ $# -gt 0 ]; do
                   PORTA="$2"; shift 2 ;;
     --host)       [ $# -ge 2 ] || { echo "erro: --host pede um valor" >&2; exit 2; }
                   HOST="$2"; shift 2 ;;
+    --browser)    ABRIR=sim; shift ;;
+    --no-browser) ABRIR=nao; shift ;;
     --reinstall)  REINSTALL=1; shift ;;
     --no-migrate) MIGRAR=0; shift ;;
     -h|--help)    # Imprime o bloco de comentário do topo, sem depender de
@@ -143,5 +154,56 @@ if esta_em_producao; then
   echo "       gunicorn: veja startup.txt e deploy/README.md." >&2
 fi
 
-dizer "servidor em http://$HOST:$PORTA  —  Ctrl+C para parar"
+# Espelha env_flag() do backend (1/true/yes/on), pelo mesmo motivo de
+# esta_em_producao: quem lê o .env é o Python, não este shell.
+dev_login_ativo() {
+  [ "$("$VPY" -c "import os;from dotenv import load_dotenv;load_dotenv();v=(os.getenv('ENABLE_DEV_LOGIN') or 'false').strip().lower();print('1' if v in ('1','true','yes','on') else '0')")" = "1" ]
+}
+
+# IP que os outros aparelhos da rede vão usar. O truque do socket UDP descobre a
+# interface de saída sem enviar pacote nenhum.
+ip_da_rede() {
+  "$VPY" -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print(s.getsockname()[0])" 2>/dev/null || true
+}
+
+LOOPBACK=0
+case "$HOST" in
+  127.0.0.1|localhost|::1) LOOPBACK=1 ;;
+esac
+
+# 0.0.0.0 é endereço de bind, não de destino: no Windows nem abre no navegador.
+# Por isso o que se imprime (e o que se abre) é localhost, nunca $HOST cru.
+dizer "servidor em http://localhost:$PORTA  —  Ctrl+C para parar"
+if [ "$LOOPBACK" -eq 0 ]; then
+  REDE="$(ip_da_rede)"
+  if [ -n "$REDE" ]; then
+    dizer "na rede local: http://$REDE:$PORTA"
+  fi
+  if dev_login_ativo; then
+    echo "" >&2
+    echo "AVISO: bind em $HOST com ENABLE_DEV_LOGIN=true." >&2
+    echo "       Qualquer aparelho na mesma rede pode entrar sem autenticação e" >&2
+    echo "       assumir a sessão de qualquer user_id, inclusive o de outra pessoa." >&2
+    echo "       Para fechar:  ./run.sh --host 127.0.0.1" >&2
+    echo "       Ou no .env:   ENABLE_DEV_LOGIN=false" >&2
+    echo "" >&2
+  fi
+fi
+
+deve_abrir() {
+  case "$ABRIR" in
+    sim) return 0 ;;
+    nao) return 1 ;;
+    *)   [ -t 1 ] ;;  # auto: só com terminal, para não atrapalhar em CI/redirecionamento
+  esac
+}
+
+if deve_abrir; then
+  dizer "abrindo o navegador assim que a porta responder"
+  # Processo à parte, de propósito: o `exec` abaixo substitui este shell, então
+  # não sobraria nada para abrir o navegador depois — e abrir antes dá "não foi
+  # possível conectar", porque o socket ainda não está escutando.
+  "$VPY" scripts/abrir_navegador.py "$PORTA" localhost >/dev/null 2>&1 &
+fi
+
 exec "$VPY" backend.py

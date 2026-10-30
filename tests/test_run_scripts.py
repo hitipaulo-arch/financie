@@ -37,11 +37,26 @@ def ler(caminho, binario=False):
 
 
 def codigo_batch(texto):
-    """Só o que o cmd de fato executa.
+    """Tudo que não é comentário: `rem` e `::` fora, `echo` fica.
 
-    Fora `rem`, `::` e `echo`. O `echo` importa: a seção de ajuda imprime
-    "Producao: gunicorn - veja startup.txt", e um teste que procure a palavra
-    `gunicorn` no arquivo inteiro acharia que o script o invoca — sendo que
+    Serve para o que o script *contém* — rótulos de `goto`, URLs impressas. As
+    linhas de `echo` importam aqui: é por elas que o launcher imprime
+    `http://localhost:8000`.
+    """
+    linhas = []
+    for linha in texto.splitlines():
+        if re.match(r"(?i)^\s*(rem\b|::)", linha):
+            continue
+        linhas.append(linha)
+    return "\n".join(linhas)
+
+
+def comandos_batch(texto):
+    """Só o que o cmd de fato executa como comando: `rem`, `::` e `echo` fora.
+
+    Serve para o que o script *invoca*. O `echo` tem que sair: a seção de ajuda
+    imprime "Producao: gunicorn - veja startup.txt", e um teste que procurasse
+    `gunicorn` no arquivo inteiro concluiria que o script o invoca — sendo que
     gunicorn nem roda em Windows nativo.
     """
     linhas = []
@@ -148,15 +163,53 @@ def test_launchers_nao_tem_segredo_hardcoded(caminho):
     assert not achados, f"possível segredo literal no script: {achados[:2]}"
 
 
-@pytest.mark.parametrize("caminho", [RUN_SH, BAT], ids=["run.sh", "start_backend.bat"])
-def test_launchers_bindam_loopback_por_padrao(caminho):
-    """0.0.0.0 exporia a máquina na rede local com dev-login liberado."""
-    texto = ler(caminho)
-    # Cobre as duas grafias: HOST="${FLASK_RUN_HOST:-127.0.0.1}" (sh) e
-    # set "HOST=127.0.0.1" (bat).
-    assert re.search(r"HOST[^\n]*127\.0\.0\.1", texto), (
-        "o host padrão precisa ser 127.0.0.1, não 0.0.0.0"
+@pytest.mark.parametrize("caminho,padrao", [
+    # A atribuição do padrão, e não qualquer menção: o texto de ajuda cita
+    # "--host 127.0.0.1" e uma regex frouxa casava com ele, aprovando o teste
+    # mesmo com o padrão errado. Daí a busca ser só no que é código.
+    (RUN_SH, r'HOST="\$\{FLASK_RUN_HOST:-0\.0\.0\.0\}"'),
+    (BAT, r'^set "HOST=0\.0\.0\.0"'),
+], ids=["run.sh", "start_backend.bat"])
+def test_bind_padrao_e_0_0_0_0(caminho, padrao):
+    """O padrão abre para a rede local — foi escolha explícita, não acidente.
+
+    Se alguém voltar para loopback, este teste e o README precisam mudar juntos:
+    a documentação afirma o contrário em vários lugares.
+    """
+    bruto = ler(caminho)
+    codigo = codigo_shell(bruto) if caminho.endswith(".sh") else codigo_batch(bruto)
+    assert re.search(padrao, codigo, re.MULTILINE), (
+        f"o bind padrão deixou de ser 0.0.0.0 em {os.path.basename(caminho)}"
     )
+
+
+@pytest.mark.parametrize("caminho", [RUN_SH, BAT], ids=["run.sh", "start_backend.bat"])
+def test_bind_aberto_vem_com_aviso_de_dev_login_exposto(caminho):
+    """Abrir para a rede com ENABLE_DEV_LOGIN=true é perigoso e precisa ser dito.
+
+    O endpoint permite assumir a sessão de qualquer user_id. Quem escolheu o
+    padrão 0.0.0.0 sabia disso; o script tem que lembrar a cada execução e
+    mostrar como fechar.
+    """
+    texto = ler(caminho)
+    assert "ENABLE_DEV_LOGIN=true" in texto, "o aviso precisa nomear o risco"
+    assert "--host 127.0.0.1" in texto, "o aviso precisa dizer como fechar"
+    assert "AVISO" in texto
+
+
+@pytest.mark.parametrize("caminho", [RUN_SH, BAT], ids=["run.sh", "start_backend.bat"])
+def test_launchers_imprimem_localhost_e_nao_o_bind_cru(caminho):
+    """`http://0.0.0.0:8000` não é um destino válido no Windows — e é lá o .bat."""
+    codigo = codigo_shell(ler(caminho)) if caminho.endswith(".sh") else codigo_batch(ler(caminho))
+    assert re.search(r"http://localhost:", codigo), "a URL impressa deve ser localhost"
+    assert not re.search(r"http://\$HOST:|http://!HOST!:", codigo), (
+        "não se imprime o endereço de bind como se fosse de destino"
+    )
+
+
+@pytest.mark.parametrize("caminho", [RUN_SH, BAT], ids=["run.sh", "start_backend.bat"])
+def test_launchers_tem_no_browser(caminho):
+    assert "--no-browser" in ler(caminho)
 
 
 @pytest.mark.parametrize("caminho", [RUN_SH, BAT], ids=["run.sh", "start_backend.bat"])
@@ -179,7 +232,7 @@ def test_launchers_tem_help(caminho):
 
 def test_bat_nao_usa_gunicorn():
     """gunicorn usa os.fork() e não roda em Windows nativo — só waitress ou o Flask."""
-    assert "gunicorn" not in codigo_batch(ler(BAT)).lower(), (
+    assert "gunicorn" not in comandos_batch(ler(BAT)).lower(), (
         "start_backend.bat não pode chamar gunicorn"
     )
 
@@ -227,7 +280,7 @@ def test_os_dois_scripts_usam_a_mesma_checagem_de_dependencias():
         assert trecho in sh and trecho in bat, f"{trecho} falta em um dos scripts"
     # Só no que é executado: os dois scripts citam certutil/sha256sum em
     # comentário, justamente para explicar por que NÃO os usam.
-    assert "certutil" not in codigo_batch(bat), "o .bat voltou a usar certutil"
+    assert "certutil" not in comandos_batch(bat), "o .bat voltou a usar certutil"
     assert "sha256sum" not in codigo_shell(sh), "o run.sh voltou a usar sha256sum"
     assert "shasum" not in codigo_shell(sh)
 
@@ -322,3 +375,85 @@ def test_suite_e_imune_a_um_env_local(tmp_path):
         else:
             with open(alvo, "wb") as fh:
                 fh.write(backup)
+
+
+# ---------------------------------------------------------------------------
+# scripts/abrir_navegador.py — testado de verdade, não por texto
+# ---------------------------------------------------------------------------
+HELPER = os.path.join(ROOT, "scripts", "abrir_navegador.py")
+
+
+def carregar_helper():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("abrir_navegador", HELPER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_helper_existe_e_os_dois_launchers_o_chamam():
+    """Um arquivo só, chamado pelos dois: a espera precisa de laço, que não cabe
+    num `-c` com `;`, e encaixar isso num `start "" /min` do cmd é frágil."""
+    assert os.path.isfile(HELPER)
+    for caminho in (RUN_SH, BAT):
+        assert "abrir_navegador.py" in ler(caminho), (
+            f"{os.path.basename(caminho)} não chama o auxiliar"
+        )
+
+
+def test_helper_nunca_abre_0_0_0_0_como_destino():
+    """0.0.0.0 é bind. No Windows não é destino válido e o navegador só erra."""
+    h = carregar_helper()
+    assert h.url_para("0.0.0.0", 8000) == "http://localhost:8000/"
+    assert h.url_para("::", 8000) == "http://localhost:8000/"
+    assert h.url_para("", 8000) == "http://localhost:8000/"
+    assert h.url_para("127.0.0.1", 8000) == "http://127.0.0.1:8000/"
+    assert h.url_para("192.168.0.10", 8000) == "http://192.168.0.10:8000/"
+
+
+def test_helper_detecta_porta_aberta_e_fechada():
+    import socket
+    h = carregar_helper()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    s.listen(1)
+    porta = s.getsockname()[1]
+    try:
+        assert h.porta_aberta(porta) is True, "não viu uma porta escutando"
+    finally:
+        s.close()
+    assert h.porta_aberta(porta) is False, "viu uma porta que acabou de fechar"
+
+
+def test_helper_sai_rapido_quando_o_servidor_nao_sobe():
+    """Se o backend falhar ao subir, o auxiliar não pode ficar 60 s girando."""
+    import socket
+    h = carregar_helper()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    fechada = s.getsockname()[1]
+    s.close()
+    assert h.main(["abrir_navegador.py", str(fechada), "localhost", "1"]) == 1
+
+
+@pytest.mark.parametrize("argv", [[], ["x"], ["x", "porta"]])
+def test_helper_rejeita_chamada_errada(argv):
+    h = carregar_helper()
+    assert h.main(argv) == 2
+
+
+def test_helper_aceita_porta_valida_sem_navegador_disponivel(monkeypatch):
+    """Servidor sem interface gráfica: abrir nada não é motivo para falhar."""
+    import socket
+    h = carregar_helper()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    s.listen(1)
+    porta = s.getsockname()[1]
+    abertos = []
+    monkeypatch.setattr(h.webbrowser, "open", lambda url, *a, **k: abertos.append(url) or False)
+    try:
+        assert h.main(["abrir_navegador.py", str(porta), "0.0.0.0", "2"]) == 0
+    finally:
+        s.close()
+    assert abertos == [f"http://localhost:{porta}/"], "abriu o endereço de bind, não localhost"
