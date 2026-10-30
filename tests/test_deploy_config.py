@@ -165,12 +165,40 @@ def test_startup_file_existe():
 
 def test_startup_usa_o_entry_point_correto():
     cmd = open(STARTUP, encoding="utf-8").read().strip()
-    assert cmd.startswith("gunicorn"), f"esperado gunicorn, obtido: {cmd[:40]}"
+    assert "gunicorn" in cmd, f"esperado gunicorn no comando: {cmd[:60]}"
     assert "wsgi:app" in cmd, (
         "o gunicorn precisa importar o objeto app de wsgi.py; "
         "'backend:app' funciona por shim, mas cria o app de forma preguiçosa"
     )
     assert "backend:app" not in cmd
+
+
+def test_startup_aplica_migracoes_antes_de_servir():
+    """O esquema tem que estar migrado antes do primeiro request.
+
+    Sem isto, um deploy com coluna nova sobe com o esquema antigo e falha em
+    tempo de execução — depois de o health check já ter dito que estava tudo bem.
+    """
+    cmd = open(STARTUP, encoding="utf-8").read().strip()
+    assert "alembic upgrade head" in cmd, (
+        "o startup precisa aplicar as migrações: 'alembic upgrade head'"
+    )
+    assert cmd.index("alembic upgrade head") < cmd.index("gunicorn"), (
+        "as migrações precisam rodar ANTES do gunicorn"
+    )
+    # `&&` e não `;`: se a migração falhar, o app não deve subir com esquema errado.
+    assert "&&" in cmd, (
+        "use '&&' entre a migração e o gunicorn — com ';' uma migração quebrada "
+        "ainda assim colocaria a aplicação no ar"
+    )
+
+
+def test_alembic_esta_no_requirements():
+    """O startup.txt chama `alembic`; sem a dependência o boot morre no Azure."""
+    texto = open(os.path.join(ROOT, "requirements.txt"), encoding="utf-8").read().lower()
+    assert re.search(r"^alembic==\d", texto, re.MULTILINE), (
+        "alembic precisa estar fixado em requirements.txt — o startup.txt o invoca"
+    )
 
 
 def test_startup_binda_na_porta_que_o_azure_espera():

@@ -25,7 +25,11 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect, generate_csrf
 from werkzeug.middleware.proxy_fix import ProxyFix
-from sqlalchemy import create_engine, Integer, String, Float, Date, Column, DateTime, Index
+from decimal import Decimal
+from sqlalchemy import (
+    create_engine, Integer, String, Float, Numeric, Date, Column, DateTime,
+    Index, case, func,
+)
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 from marshmallow import Schema, fields, ValidationError, validate
 from authlib.integrations.flask_client import OAuth
@@ -39,8 +43,20 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Configuração
 # ---------------------------------------------------------------------------
+def resolve_db_url() -> str:
+    """Resolve a connection string: DATABASE_URL (Azure) → GF_DB_URL (local).
+
+    Existe como função (e não só a constante abaixo) porque o `alembic/env.py`
+    precisa re-resolver no momento da migração. Importar a constante `DB_URL`
+    congelaria o valor lido no primeiro import do módulo — dentro de um processo
+    de teste, ou de um boot que mudou o ambiente depois, a migração iria para o
+    banco errado sem nenhum aviso.
+    """
+    return os.getenv("DATABASE_URL") or os.getenv("GF_DB_URL", "sqlite:///data.db")
+
+
 # Suporta tanto DATABASE_URL (Azure) quanto GF_DB_URL (local)
-DB_URL = os.getenv("DATABASE_URL") or os.getenv("GF_DB_URL", "sqlite:///data.db")
+DB_URL = resolve_db_url()
 # Suporta tanto SECRET_KEY (Azure) quanto FLASK_SECRET_KEY (local)
 _SECRET_KEY_CONFIGURED = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY")
 FLASK_SECRET_KEY = _SECRET_KEY_CONFIGURED or secrets.token_hex(32)
@@ -118,6 +134,68 @@ def internal_path(path: str) -> str:
         return "/"
     return path
 
+def money_type(precision: int = 14, scale: int = 2):
+    """Tipo monetário: NUMERIC(precision, scale) em qualquer dialeto.
+
+    Antes era `Float`. Somar centavos em binário acumula erro — o clássico
+    `0.1 + 0.2 != 0.3` — e o resumo financeiro do usuário é exatamente uma soma
+    longa de centavos. NUMERIC é exato no PostgreSQL e, no SQLite, o SQLAlchemy
+    quantiza o valor lido para `scale` casas e devolve Decimal, então as somas em
+    Python também ficam exatas.
+
+    Custo conhecido no SQLite: o dialeto não tem Decimal nativo, então o
+    SQLAlchemy converte float <-> Decimal e emite um SAWarning uma vez. Vale a
+    troca — dinheiro errado é pior que log ruidoso.
+
+    Nada aqui vaza para as rotas: `money()` abaixo normaliza Decimal e float para
+    o mesmo resultado na borda JSON (jsonify não serializa Decimal).
+    """
+    return Numeric(precision, scale)
+
+
+def quantity_type(precision: int = 20, scale: int = 8):
+    """Tipo para quantidades e cotações — fração importa aqui.
+
+    Diferente de `money_type()`: uma posição pode ser 0.00012345 BTC ou 0.375 de
+    uma ação fracionada, e um token pode custar 0.0000012. Arredondar isso para 2
+    casas (NUMERIC(14,2)) zeraria a posição. Por isso 8 casas decimais.
+    """
+    return Numeric(precision, scale)
+
+
+def money(value, default: float = 0.0) -> float:
+    """Converte um valor monetário do banco para float de 2 casas.
+
+    `Numeric` devolve `Decimal` no PostgreSQL e `float` no SQLite; `jsonify` não
+    serializa `Decimal` (seria 500 só em produção). Passar tudo por aqui torna os
+    dois dialetos equivalentes na borda JSON.
+    """
+    if value is None:
+        return default
+    if isinstance(value, Decimal):
+        return float(round(value, 2))
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return default
+
+
+def meses_decorridos(inicio: date, hoje: date) -> int:
+    """Meses completos entre duas datas (0 dentro do próprio mês de início)."""
+    return (hoje.year - inicio.year) * 12 + (hoje.month - inicio.month)
+
+
+def parcela_ativa(inicio, total_meses, hoje: date) -> bool:
+    """Uma compra em N parcelas ainda pesa no orçamento?
+
+    Só enquanto não termina. `total_meses <= 0` ou data ausente contam como
+    encerrada — defensivo para linhas gravadas antes desta validação existir.
+    """
+    if not inicio or not total_meses or total_meses <= 0:
+        return False
+    return meses_decorridos(inicio, hoje) < total_meses
+
+
 # CRITICAL: Defer engine creation to avoid module import failures
 # If DB_URL is invalid/unreachable, this will cause gunicorn to timeout
 # So we create it lazily inside create_app()
@@ -126,15 +204,41 @@ engine = None
 SessionLocal = None
 
 def get_engine():
+    """Cria a engine uma única vez — e falha alto se o banco estiver mal configurado.
+
+    Antes, qualquer exceção aqui caía num `sqlite:///:memory:` silencioso. O
+    efeito era o pior possível: o app subia "verde", o health check passava, o
+    usuário criava transações e **cada conexão nova começava um banco vazio** —
+    os dados evaporavam sem nenhum erro no log. Em produção isso seria
+    descoberto só depois de perder tudo.
+    """
     global engine
     if engine is None:
         try:
             engine = create_engine(DB_URL, echo=False, future=True)
         except Exception as e:
-            logger.error(f"Failed to create engine: {e}")
-            # Create a fallback in-memory SQLite for now
-            engine = create_engine("sqlite:///:memory:", echo=False, future=True)
+            # Nunca logar DB_URL: a connection string carrega a senha do banco.
+            logger.critical(
+                "Falha ao configurar o banco de dados",
+                extra={"error_code": "db_engine_failed", "exception": type(e).__name__},
+            )
+            raise RuntimeError(
+                "Não foi possível configurar o banco de dados "
+                f"({type(e).__name__}). Verifique GF_DB_URL/DATABASE_URL."
+            ) from e
     return engine
+
+def utcnow() -> datetime:
+    """Único ponto que produz "agora" no aplicativo.
+
+    Sempre em UTC. As colunas são `DateTime` sem timezone de propósito: no
+    PostgreSQL (`TIMESTAMP`) e no SQLite o valor é gravado como wall-clock UTC e
+    volta *naive*. Usar `DateTime(timezone=True)` faria o PostgreSQL devolver
+    datetime com fuso e o SQLite sem — divergência de dialeto dentro do código.
+    Regra: nunca comparar um datetime vindo do banco com um `now()` local.
+    """
+    return datetime.now(UTC)
+
 
 def get_session_local():
     global SessionLocal
@@ -155,7 +259,7 @@ class Transaction(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(String(64), index=True, nullable=False)
     description = Column(String(255), nullable=False)
-    amount = Column(Float, nullable=False)
+    amount = Column(money_type(), nullable=False)
     type = Column(String(16), nullable=False)  # income | expense
     date = Column(Date, nullable=False)
     deleted_at = Column(DateTime, nullable=True)  # Soft delete timestamp
@@ -172,7 +276,7 @@ class Installment(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(String(64), index=True, nullable=False)
     description = Column(String(255), nullable=False)
-    monthly_value = Column(Float, nullable=False)
+    monthly_value = Column(money_type(), nullable=False)
     total_months = Column(Integer, nullable=False)
     date_added = Column(Date, nullable=False)
     deleted_at = Column(DateTime, nullable=True)  # Soft delete timestamp
@@ -208,59 +312,90 @@ class Investment(Base):
     user_id = Column(String(64), index=True, nullable=False)
     name = Column(String(256), nullable=False)  # ex: "Tesla", "Fundo Imobiliário"
     asset_type = Column(String(64), nullable=False)  # stocks, reit, crypto, bonds, funds, savings, real_estate, commodities
-    amount = Column(Float, nullable=False)  # quantidade ou valor investido
-    purchase_price = Column(Float, nullable=False)  # preço de compra/cotação
-    current_price = Column(Float, nullable=True)  # preço atual
+    amount = Column(quantity_type(), nullable=False)  # quantidade (frações valem)
+    purchase_price = Column(quantity_type(), nullable=False)  # preço de compra/cotação
+    current_price = Column(quantity_type(), nullable=True)  # preço atual
     purchase_date = Column(Date, nullable=False)
     target_return = Column(Float, nullable=True)  # % de retorno esperado
     status = Column(String(32), nullable=False, default='active')  # active | sold | matured
     notes = Column(String(1024), nullable=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.now)
-    updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+    created_at = Column(DateTime, nullable=False, default=utcnow)
+    updated_at = Column(DateTime, nullable=False, default=utcnow, onupdate=utcnow)
     deleted_at = Column(DateTime, nullable=True)  # Soft delete timestamp
+
+
+# ---------------------------------------------------------------------------
+# Validação de entrada
+# ---------------------------------------------------------------------------
+# Os limites espelham as colunas do banco: NUMERIC(14,2) e String(n).
+# Sem eles o SQLite aceitava qualquer coisa (uma description de 5.000 caracteres
+# gravava sem erro) enquanto o PostgreSQL devolveria 500 — a mesma requisição
+# funcionava ou não dependendo do dialeto. E dinheiro negativo ou zero passava no
+# POST mas era rejeitado no PUT.
+MAX_DINHEIRO = 999_999_999_999.99  # 12 dígitos inteiros + 2 casas
+
+valor_positivo = validate.Range(
+    min=0.01, max=MAX_DINHEIRO,
+    error="Deve ser um valor positivo (mínimo 0.01).",
+)
+preco_nao_negativo = validate.Range(
+    min=0, max=MAX_DINHEIRO,
+    error="Não pode ser negativo.",
+)
+percentual = validate.Range(
+    min=-100, max=10000,
+    error="Percentual fora de um intervalo razoável.",
+)
+# Quantidade de um ativo: precisa aceitar frações (0.00012345 BTC, 0.375 de ação
+# fracionada). O mínimo de 0.01 usado para dinheiro zeraria essas posições.
+MAX_QUANTIDADE = 999_999_999_999.99999999  # NUMERIC(20,8)
+quantidade_positiva = validate.Range(
+    min=0.00000001, max=MAX_QUANTIDADE,
+    error="Quantidade deve ser positiva.",
+)
 
 
 class ConsentSchema(Schema):
     id = fields.Int(dump_only=True)
-    user_id = fields.Str(required=True, validate=validate.Length(min=1))
-    consent_id = fields.Str(required=True, validate=validate.Length(min=4))
-    provider = fields.Str(required=True, validate=validate.Length(min=2))
-    scopes = fields.Str(required=True)
+    user_id = fields.Str(required=True, validate=validate.Length(min=1, max=64))
+    consent_id = fields.Str(required=True, validate=validate.Length(min=4, max=128))
+    provider = fields.Str(required=True, validate=validate.Length(min=2, max=64))
+    scopes = fields.Str(required=True, validate=validate.Length(max=512))
     status = fields.Str(required=True, validate=validate.OneOf(["active", "revoked", "expired"]))
     created_at = fields.DateTime(dump_only=True)
 
 
 class InvestmentSchema(Schema):
     id = fields.Int(dump_only=True)
-    user_id = fields.Str(required=True, validate=validate.Length(min=1))
-    name = fields.Str(required=True, validate=validate.Length(min=1))
+    user_id = fields.Str(required=True, validate=validate.Length(min=1, max=64))
+    name = fields.Str(required=True, validate=validate.Length(min=1, max=256))
     asset_type = fields.Str(required=True, validate=validate.OneOf(["stocks", "reit", "crypto", "bonds", "funds", "savings", "real_estate", "commodities"]))
-    amount = fields.Float(required=True)
-    purchase_price = fields.Float(required=True)
-    current_price = fields.Float(allow_none=True)
+    amount = fields.Float(required=True, validate=quantidade_positiva)
+    purchase_price = fields.Float(required=True, validate=preco_nao_negativo)
+    current_price = fields.Float(allow_none=True, validate=preco_nao_negativo)
     purchase_date = fields.Date(required=True)
-    target_return = fields.Float(allow_none=True)
+    target_return = fields.Float(allow_none=True, validate=percentual)
     status = fields.Str(required=True, validate=validate.OneOf(["active", "sold", "matured"]))
-    notes = fields.Str(allow_none=True)
+    notes = fields.Str(allow_none=True, validate=validate.Length(max=1024))
     created_at = fields.DateTime(dump_only=True)
     updated_at = fields.DateTime(dump_only=True)
 
 
 class TransactionSchema(Schema):
     id = fields.Int(dump_only=True)
-    user_id = fields.Str(required=True, validate=validate.Length(min=1))
-    description = fields.Str(required=True, validate=validate.Length(min=1))
-    amount = fields.Float(required=True)
+    user_id = fields.Str(required=True, validate=validate.Length(min=1, max=64))
+    description = fields.Str(required=True, validate=validate.Length(min=1, max=255))
+    amount = fields.Float(required=True, validate=valor_positivo)
     type = fields.Str(required=True, validate=validate.OneOf(["income", "expense"]))
     date = fields.Date(required=True)
 
 
 class InstallmentSchema(Schema):
     id = fields.Int(dump_only=True)
-    user_id = fields.Str(required=True, validate=validate.Length(min=1))
-    description = fields.Str(required=True, validate=validate.Length(min=1))
-    monthly_value = fields.Float(required=True)
-    total_months = fields.Int(required=True)
+    user_id = fields.Str(required=True, validate=validate.Length(min=1, max=64))
+    description = fields.Str(required=True, validate=validate.Length(min=1, max=255))
+    monthly_value = fields.Float(required=True, validate=valor_positivo)
+    total_months = fields.Int(required=True, validate=validate.Range(min=1, max=1200))
     date_added = fields.Date(required=True)
 
 
@@ -403,14 +538,33 @@ def create_app() -> Flask:
             "header_name": "X-CSRFToken",
         }), 200
 
-    # Cria tabelas se não existirem (usando engine lazy-loaded)
+    # Cria as tabelas se não existirem.
+    #
+    # Rede de segurança, não o mecanismo principal: o `startup.txt` roda
+    # `alembic upgrade head` antes do gunicorn, mas o portal do Azure permite
+    # sobrescrever o comando de inicialização — sem isto, um deploy com o comando
+    # errado não criaria tabela alguma.
+    #
+    # O que mudou na Fase 3: a exceção NÃO é mais engolida. O `except` anterior
+    # registrava "Failed to create database tables" e seguia em frente ("App will
+    # still start, just without database"). Na prática: o health check passava, o
+    # Azure trocava o slot e TODO request devolvia 500 — uma falha total de
+    # serviço anunciada como deploy bem-sucedido. Sem banco o aplicativo não serve
+    # para nada, então o boot falha e o deploy é rejeitado.
+    db_engine = get_engine()
     try:
-        db_engine = get_engine()
         Base.metadata.create_all(db_engine)
         logger.info("Database tables created successfully")
     except Exception as e:
-        logger.error(f"Failed to create database tables: {e}")
-        # App will still start, just without database
+        # Nunca logar a connection string: ela carrega a senha do banco.
+        logger.critical(
+            "Falha ao preparar o esquema do banco",
+            extra={"error_code": "db_schema_failed", "exception": type(e).__name__},
+        )
+        raise RuntimeError(
+            "Não foi possível preparar o esquema do banco de dados "
+            f"({type(e).__name__}). Verifique GF_DB_URL/DATABASE_URL."
+        ) from e
     
     # Configurar OAuth
     oauth = OAuth(app)
@@ -451,11 +605,33 @@ def create_app() -> Flask:
             raise RuntimeError("Database session not initialized")
         return session_factory()
 
-    def parse_json(schema: Schema, payload: dict):
+    def parse_json(schema: Schema, payload: dict, partial: bool = False):
         try:
-            return schema.load(payload)
+            return schema.load(payload, partial=partial)
         except ValidationError as err:
             raise BadRequest(err.messages)
+
+    def apply_update(obj, schema: Schema, payload: dict, campos: tuple):
+        """Valida um payload parcial com o MESMO schema do POST e aplica só o permitido.
+
+        Substitui os blocos `for field in [...]` com `try/except` que cada PUT
+        tinha. As regras viviam em dois lugares e divergiam: o POST aceitava
+        `amount <= 0` e o PUT rejeitava; `description` sem limite de tamanho num
+        e com `strptime` manual no outro. Agora a fonte de verdade é o schema.
+
+        Dois detalhes de segurança/robustez:
+        - `campos` é uma whitelist. `user_id` fica de fora de propósito: sem isso,
+          enviar o campo no body transferiria o registro para outra conta.
+        - campo desconhecido vira 400 (default do Marshmallow é `unknown=RAISE`).
+          Antes era ignorado em silêncio — o formulário de edição de investimento
+          mandava `asset_type`, `amount`, `purchase_price` e `purchase_date`, o
+          PUT descartava os quatro e respondia 200 como se tivesse salvado.
+        """
+        dados = parse_json(schema, payload, partial=True)
+        for campo in campos:
+            if campo in dados:
+                setattr(obj, campo, dados[campo])
+        return dados
 
     def today_date() -> date:
         return date.today()
@@ -749,7 +925,7 @@ def create_app() -> Flask:
             provider=data['provider'],
             scopes=data['scopes'],
             status=data['status'],
-            created_at=datetime.now(UTC)
+            created_at=utcnow()
         )
         session_db.add(obj)
         session_db.commit()
@@ -850,28 +1026,9 @@ def create_app() -> Flask:
         ).first()
         if not txn:
             raise NotFound("Transação não encontrada")
-        # Campos permitidos
-        for field in ["description", "amount", "type", "date"]:
-            if field in payload:
-                if field == "amount":
-                    try:
-                        val = float(payload[field])
-                        if val <= 0:
-                            raise ValueError
-                        setattr(txn, field, val)
-                    except Exception:
-                        raise BadRequest({"amount": ["Valor inválido"]})
-                elif field == "date":
-                    try:
-                        setattr(txn, field, datetime.strptime(payload[field], "%Y-%m-%d").date())
-                    except Exception:
-                        raise BadRequest({"date": ["Formato deve ser YYYY-MM-DD"]})
-                elif field == "type":
-                    if payload[field] not in ["income", "expense"]:
-                        raise BadRequest({"type": ["Deve ser income ou expense"]})
-                    setattr(txn, field, payload[field])
-                else:
-                    setattr(txn, field, payload[field])
+        # Mesmas regras do POST (schema) e só estes campos são editáveis.
+        apply_update(txn, transaction_schema, payload,
+                     ("description", "amount", "type", "date"))
         session_db.commit()
         return jsonify(transaction_schema.dump(txn))
 
@@ -888,7 +1045,7 @@ def create_app() -> Flask:
         if not txn:
             raise NotFound("Transação não encontrada")
         # Soft delete: set deleted_at timestamp
-        txn.deleted_at = datetime.now(UTC)
+        txn.deleted_at = utcnow()
         session_db.commit()
         return jsonify({"deleted": txn_id})
 
@@ -905,9 +1062,13 @@ def create_app() -> Flask:
         """
         session_db = get_session()
         
-        # Buscar transações dos últimos 30 dias
+        # Buscar transações dos últimos 30 dias.
+        # Projeção de colunas: a análise usa só tipo, descrição e valor. Carregar o
+        # objeto ORM inteiro traz o resto das colunas de cada linha sem necessidade.
         thirty_days_ago = today_date() - timedelta(days=30)
-        recent_txns = session_db.query(Transaction).filter(
+        recent_txns = session_db.query(
+            Transaction.type, Transaction.description, Transaction.amount
+        ).filter(
             Transaction.user_id == user_id,
             Transaction.deleted_at.is_(None),
             Transaction.date >= thirty_days_ago
@@ -926,16 +1087,17 @@ def create_app() -> Flask:
             })
             return jsonify({"suggestions": suggestions})
         
-        # Calcular estatísticas
-        total_income = sum(float(t.amount) for t in recent_txns if t.type == "income")
-        total_expense = sum(float(t.amount) for t in recent_txns if t.type == "expense")
-        balance = total_income - total_expense
+        # Calcular estatísticas. money() normaliza Decimal (PostgreSQL) e float
+        # (SQLite) para a mesma coisa na borda JSON.
+        total_income = money(sum(a for t, _, a in recent_txns if t == "income"))
+        total_expense = money(sum(a for t, _, a in recent_txns if t == "expense"))
+        balance = money(total_income - total_expense)
         
         # Análise por descrição (categorias informais)
         expense_categories = {}
-        for txn in recent_txns:
-            if txn.type == "expense":
-                desc = txn.description.lower()
+        for tipo, descricao, valor in recent_txns:
+            if tipo == "expense":
+                desc = (descricao or "").lower()
                 # Categorizar por palavras-chave
                 if any(word in desc for word in ['restaurante', 'ifood', 'uber eats', 'almoço', 'jantar', 'lanche']):
                     category = 'alimentacao'
@@ -950,7 +1112,9 @@ def create_app() -> Flask:
                 else:
                     category = 'outros'
                 
-                expense_categories[category] = expense_categories.get(category, 0) + float(txn.amount)
+                expense_categories[category] = (
+                    expense_categories.get(category, 0.0) + float(valor or 0)
+                )
         
         # SUGESTÃO 1: Saldo negativo
         if balance < 0:
@@ -1133,31 +1297,9 @@ def create_app() -> Flask:
         ).first()
         if not inst:
             raise NotFound("Parcela não encontrada")
-        for field in ["description", "monthly_value", "total_months", "date_added"]:
-            if field in payload:
-                if field in ["monthly_value"]:
-                    try:
-                        val = float(payload[field])
-                        if val <= 0:
-                            raise ValueError
-                        setattr(inst, field, val)
-                    except Exception:
-                        raise BadRequest({field: ["Valor inválido"]})
-                elif field in ["total_months"]:
-                    try:
-                        val = int(payload[field])
-                        if val <= 0:
-                            raise ValueError
-                        setattr(inst, field, val)
-                    except Exception:
-                        raise BadRequest({field: ["Inteiro positivo"]})
-                elif field == "date_added":
-                    try:
-                        setattr(inst, field, datetime.strptime(payload[field], "%Y-%m-%d").date())
-                    except Exception:
-                        raise BadRequest({field: ["Formato deve ser YYYY-MM-DD"]})
-                else:
-                    setattr(inst, field, payload[field])
+        # Mesmas regras do POST (schema) e só estes campos são editáveis.
+        apply_update(inst, installment_schema, payload,
+                     ("description", "monthly_value", "total_months", "date_added"))
         session_db.commit()
         return jsonify(installment_schema.dump(inst))
 
@@ -1174,7 +1316,7 @@ def create_app() -> Flask:
         if not inst:
             raise NotFound("Parcela não encontrada")
         # Soft delete: set deleted_at timestamp
-        inst.deleted_at = datetime.now(UTC)
+        inst.deleted_at = utcnow()
         session_db.commit()
         return jsonify({"deleted": inst_id})
 
@@ -1185,33 +1327,51 @@ def create_app() -> Flask:
     @require_auth
     def summary(user_id: str):
         session_db = get_session()
-        # Filtrar apenas registros não deletados
-        txns = session_db.query(Transaction).filter(
-            Transaction.user_id == user_id,
-            Transaction.deleted_at.is_(None)
-        ).all()
-        insts = session_db.query(Installment).filter(
+
+        # Somas feitas no banco (SUM + GROUP BY) em vez de carregar todas as
+        # linhas e somar em Python: o custo deixa de crescer com o histórico.
+        por_tipo = dict(
+            session_db.query(
+                Transaction.type,
+                func.coalesce(func.sum(Transaction.amount), 0),
+            ).filter(
+                Transaction.user_id == user_id,
+                Transaction.deleted_at.is_(None),
+            ).group_by(Transaction.type).all()
+        )
+        income = money(por_tipo.get("income"))
+        expenses_avulsa = money(por_tipo.get("expense"))
+
+        # Parcelas: só as que AINDA estão sendo pagas. Antes o resumo somava todas
+        # as parcelas cadastradas para sempre — uma compra em 12x feita há três
+        # anos continuava pesando no orçamento do mês.
+        # A aritmética de meses é por linha (cada compra tem sua data de início) e
+        # não é portável entre SQLite e PostgreSQL, então projetamos só as três
+        # colunas necessárias e filtramos aqui, sem carregar objeto ORM inteiro.
+        hoje = today_date()
+        parcelas = session_db.query(
+            Installment.monthly_value,
+            Installment.date_added,
+            Installment.total_months,
+        ).filter(
             Installment.user_id == user_id,
-            Installment.deleted_at.is_(None)
+            Installment.deleted_at.is_(None),
         ).all()
-        # Calcular somas iterando sobre objetos ORM
-        income = 0.0
-        expenses_avulsa = 0.0
-        for t in txns:
-            amt = float(t.amount) if t.amount else 0.0
-            if t.type and t.type == "income":
-                income += amt
-            elif t.type and t.type == "expense":
-                expenses_avulsa += amt
-        expenses_parcelas = sum(float(i.monthly_value) if i.monthly_value else 0.0 for i in insts) if insts else 0.0
-        expenses_total = float(expenses_avulsa) + float(expenses_parcelas)
-        balance = float(income) - float(expenses_total)
+        ativas = [
+            mv for mv, inicio, total in parcelas if parcela_ativa(inicio, total, hoje)
+        ]
+        expenses_parcelas = money(sum(ativas)) if ativas else 0.0
+
+        expenses_total = money(expenses_avulsa + expenses_parcelas)
+        balance = money(income - expenses_total)
         return jsonify({
-            "income": round(income, 2),
-            "expenses_avulsa": round(expenses_avulsa, 2),
-            "expenses_parcelas": round(expenses_parcelas, 2),
-            "expenses_total": round(expenses_total, 2),
-            "balance": round(balance, 2)
+            "income": income,
+            "expenses_avulsa": expenses_avulsa,
+            "expenses_parcelas": expenses_parcelas,
+            "expenses_total": expenses_total,
+            "balance": balance,
+            "parcelas_ativas": len(ativas),
+            "parcelas_encerradas": len(parcelas) - len(ativas),
         })
 
     # -------------------------------------------------------------------
@@ -1288,39 +1448,85 @@ def create_app() -> Flask:
         
         inserted = []
         skipped = 0
+        invalidos = 0
 
-        # Pré-carrega transações existentes do usuário para deduplicação (apenas não deletadas)
-        existing = session_db.query(Transaction).filter(
-            Transaction.user_id == user_id,
-            Transaction.deleted_at.is_(None)
-        ).all()
-        def fingerprint(d: dict) -> str:
-            return f"{d['date']}|{d['type']}|{d['amount']:.2f}|{d['description'].strip().lower()}"
-        existing_fp = {fingerprint({
-            'date': t.date.isoformat(),
-            'type': t.type,
-            'amount': t.amount,
-            'description': t.description
-        }) for t in existing}
+        def fingerprint(data_, tipo, valor, descricao) -> Optional[str]:
+            """Assinatura estável de uma transação, ou None se faltar dado essencial.
 
-        for tx in result["transactions"]:
-            fp = fingerprint(tx)
-            if fp in existing_fp:
+            Antes era `f"{d['date']}|{d['type']}|{d['amount']:.2f}|..."` com índice
+            direto: um provider que omitisse qualquer um dos campos derrubava o
+            endpoint inteiro com KeyError (500), e um `amount` que não fosse número
+            estourava no format. Agora nada aqui lança — o item inválido é pulado.
+            """
+            if isinstance(data_, datetime):
+                dia = data_.date().isoformat()
+            elif isinstance(data_, date):
+                dia = data_.isoformat()
+            else:
+                dia = str(data_ or "").strip()[:10]
+            if not dia or not tipo:
+                return None
+            return (
+                f"{dia}|{str(tipo).strip().lower()}|"
+                f"{money(valor):.2f}|{str(descricao or '').strip().lower()}"
+            )
+
+        # Deduplicação contra TUDO que o usuário já tem, inclusive linhas com soft
+        # delete. O filtro `deleted_at IS NULL` que estava aqui fazia o oposto do
+        # esperado: apagar uma transação importada a trazia de volta no sync
+        # seguinte, já que ela deixava de constar entre as existentes.
+        existentes = session_db.query(
+            Transaction.date, Transaction.type,
+            Transaction.amount, Transaction.description,
+        ).filter(Transaction.user_id == user_id).all()
+        existing_fp = set()
+        for linha in existentes:
+            fp = fingerprint(*linha)
+            if fp:
+                existing_fp.add(fp)
+
+        for tx in (result.get("transactions") or []):
+            if not isinstance(tx, dict):
+                invalidos += 1
+                continue
+            fp = fingerprint(
+                tx.get("date"), tx.get("type"), tx.get("amount"), tx.get("description")
+            )
+            if fp and fp in existing_fp:
                 skipped += 1
                 continue
-            data = parse_json(transaction_schema, {**tx, "user_id": user_id})
+            try:
+                data = transaction_schema.load({**tx, "user_id": user_id})
+            except ValidationError as err:
+                # Um item malformado do banco não pode abortar a importação inteira
+                # (era o que acontecia: parse_json lançava BadRequest e o sync
+                # devolvia 400 sem gravar nada).
+                invalidos += 1
+                logger.warning(
+                    "Item inválido ignorado na sincronização Open Finance",
+                    extra={
+                        "user_id": user_id, "endpoint": "/openfinance/sync",
+                        "error_code": "sync_item_invalid",
+                        "fields": sorted(err.messages),
+                    },
+                )
+                continue
             obj = Transaction(**data)
             session_db.add(obj)
             inserted.append(obj)
-            existing_fp.add(fp)
+            if fp:
+                existing_fp.add(fp)
         session_db.commit()
         duration_ms = (time.time() - start_time) * 1000
-        logger.info("Sincronização Open Finance concluída", extra={"user_id": user_id, "endpoint": "/openfinance/sync", "imported": len(inserted), "skipped": skipped, "duration_ms": round(duration_ms, 2)})
+        logger.info("Sincronização Open Finance concluída", extra={"user_id": user_id, "endpoint": "/openfinance/sync", "imported": len(inserted), "skipped": skipped, "invalid": invalidos, "duration_ms": round(duration_ms, 2)})
         return jsonify({
             "status": "success",
             "source": result.get("source"),
             "imported": len(inserted),
             "skipped_duplicates": skipped,
+            # Novo: itens que o provider mandou mas não passaram na validação.
+            # Antes um único item assim abortava o sync inteiro com 400.
+            "skipped_invalid": invalidos,
             "transactions": transactions_schema.dump(inserted),
         }), 201
 
@@ -1398,31 +1604,17 @@ def create_app() -> Flask:
         if not inv:
             raise NotFound("Investimento não encontrado")
         
-        # Campos permitidos para update
-        for field in ["name", "current_price", "target_return", "status", "notes"]:
-            if field in payload:
-                if field == "current_price":
-                    try:
-                        val = float(payload[field])
-                        if val < 0:
-                            raise ValueError
-                        setattr(inv, field, val)
-                    except Exception:
-                        raise BadRequest({field: ["Valor inválido"]})
-                elif field == "target_return":
-                    try:
-                        val = float(payload[field])
-                        setattr(inv, field, val)
-                    except Exception:
-                        raise BadRequest({field: ["Valor inválido"]})
-                elif field == "status":
-                    if payload[field] not in ["active", "sold", "matured"]:
-                        raise BadRequest({field: ["Status inválido"]})
-                    setattr(inv, field, payload[field])
-                else:
-                    setattr(inv, field, payload[field])
-        
-        inv.updated_at = datetime.now(UTC)
+        # Antes só 5 campos eram aceitos aqui: name, current_price,
+        # target_return, status e notes. O formulário de edição do frontend envia
+        # também asset_type, amount, purchase_price e purchase_date — que eram
+        # descartados em silêncio enquanto a resposta 200 dizia que salvou.
+        # Agora todos os campos de negócio são editáveis, validados pelo schema.
+        apply_update(inv, investment_schema, payload, (
+            "name", "asset_type", "amount", "purchase_price", "current_price",
+            "purchase_date", "target_return", "status", "notes",
+        ))
+
+        inv.updated_at = utcnow()
         session_db.commit()
         result = investment_schema.dump(inv)
         return jsonify(result)
@@ -1441,7 +1633,7 @@ def create_app() -> Flask:
         if not inv:
             raise NotFound("Investimento não encontrado")
         
-        inv.deleted_at = datetime.now(UTC)
+        inv.deleted_at = utcnow()
         session_db.commit()
         return jsonify({"deleted": inv_id})
 
@@ -1451,14 +1643,32 @@ def create_app() -> Flask:
     def get_portfolio_analysis(user_id: str):
         """Análise detalhada do portfólio de investimentos."""
         session_db = get_session()
-        
-        investments = session_db.query(Investment).filter(
+
+        filtro = (
             Investment.user_id == user_id,
             Investment.deleted_at.is_(None),
-            Investment.status == "active"
-        ).all()
-        
-        if not investments:
+            Investment.status == "active",
+        )
+
+        # Valor investido = quantidade x preço de compra.
+        # Valor atual usa a cotação corrente; quando ela não existe (ou é zero, que
+        # esta API sempre tratou como "cotação desconhecida") cai no valor
+        # investido — mesmo comportamento de antes, agora expresso em SQL.
+        investido = Investment.amount * Investment.purchase_price
+        atual = case(
+            (func.coalesce(Investment.current_price, 0) == 0, investido),
+            else_=Investment.amount * Investment.current_price,
+        )
+
+        # Agregação no banco. Antes carregávamos todas as posições para somar em
+        # Python; agora são duas consultas cujo custo não cresce com o portfólio.
+        total_posicoes, soma_investido, soma_atual = session_db.query(
+            func.count(Investment.id),
+            func.coalesce(func.sum(investido), 0),
+            func.coalesce(func.sum(atual), 0),
+        ).filter(*filtro).one()
+
+        if not total_posicoes:
             return jsonify({
                 "portfolio": {
                     "total_invested": 0,
@@ -1476,42 +1686,38 @@ def create_app() -> Flask:
                     }
                 ]
             })
-        
-        # Calcular estatísticas
-        total_invested = 0
-        current_value = 0
+
+        por_tipo = session_db.query(
+            Investment.asset_type,
+            func.count(Investment.id),
+            func.coalesce(func.sum(investido), 0),
+            func.coalesce(func.sum(atual), 0),
+        ).filter(*filtro).group_by(Investment.asset_type).all()
+
+        # money() normaliza Decimal (PostgreSQL, NUMERIC) e float (SQLite) para o
+        # mesmo tipo — jsonify não serializa Decimal, e sem isso o endpoint daria
+        # 500 apenas em produção.
+        total_invested = money(soma_investido)
+        current_value = money(soma_atual)
+
         by_asset_type = {}
-        
-        for inv in investments:
-            invested = float(inv.amount) * float(inv.purchase_price) if inv.purchase_price else 0
-            current = float(inv.amount) * float(inv.current_price) if inv.current_price else invested
-            
-            total_invested += invested
-            current_value += current
-            
-            # Agrupar por tipo de ativo
-            asset_type = inv.asset_type
-            if asset_type not in by_asset_type:
-                by_asset_type[asset_type] = {
-                    "invested": 0,
-                    "current_value": 0,
-                    "count": 0,
-                    "return_percentage": 0
-                }
-            
-            by_asset_type[asset_type]["invested"] += invested
-            by_asset_type[asset_type]["current_value"] += current
-            by_asset_type[asset_type]["count"] += 1
-        
-        # Calcular retorno percentual por tipo
-        for asset_type in by_asset_type:
-            if by_asset_type[asset_type]["invested"] > 0:
-                ret = (by_asset_type[asset_type]["current_value"] - by_asset_type[asset_type]["invested"]) / by_asset_type[asset_type]["invested"] * 100
-                by_asset_type[asset_type]["return_percentage"] = round(ret, 2)
-        
-        total_return = current_value - total_invested
-        return_percentage = (total_return / total_invested * 100) if total_invested > 0 else 0
-        
+        for asset_type, quantidade, inv_bruto, cur_bruto in por_tipo:
+            inv_valor = money(inv_bruto)
+            cur_valor = money(cur_bruto)
+            by_asset_type[asset_type] = {
+                "invested": inv_valor,
+                "current_value": cur_valor,
+                "count": quantidade,
+                "return_percentage": round(
+                    (cur_valor - inv_valor) / inv_valor * 100, 2
+                ) if inv_valor > 0 else 0,
+            }
+
+        total_return = money(current_value - total_invested)
+        return_percentage = round(
+            total_return / total_invested * 100, 2
+        ) if total_invested > 0 else 0
+
         # Gerar recomendações
         recommendations = []
         
@@ -1570,7 +1776,7 @@ def create_app() -> Flask:
                     "count": v["count"],
                     "return_percentage": v["return_percentage"]
                 } for k, v in by_asset_type.items()},
-                "count": len(investments)
+                "count": total_posicoes
             },
             "recommendations": recommendations
         })

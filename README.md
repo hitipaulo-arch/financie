@@ -130,7 +130,70 @@ Tudo o que é preciso está em **[`deploy/README.md`](deploy/README.md)**:
   por sintoma.
 
 ## Base de Dados
-SQLite criada automaticamente (`data.db`). Para redefinir: apagar o ficheiro antes de iniciar.
+
+O código é portátil entre **SQLite** e **PostgreSQL** — nada nas migrações ou nas
+consultas usa recurso de um dialeto só. A connection string vem de
+`DATABASE_URL` (padrão do Azure) ou `GF_DB_URL` (local), caindo em
+`sqlite:///data.db`:
+
+```powershell
+$env:GF_DB_URL = "sqlite:///data.db"                                  # local
+$env:GF_DB_URL = "postgresql+psycopg2://u:s@host:5432/financie"       # produção
+```
+
+### Tipos monetários
+
+| Coluna | Tipo | Por quê |
+| --- | --- | --- |
+| `transactions.amount`, `installments.monthly_value` | `NUMERIC(14,2)` | Dinheiro. `FLOAT` é binário: `0.1` não tem representação exata e somar centavos deriva (`0.1 + 0.2 = 0.30000000000000004`). O resumo do usuário é exatamente uma soma longa de centavos. |
+| `investments.amount`, `purchase_price`, `current_price` | `NUMERIC(20,8)` | Quantidade e cotação. Duas casas aqui **zerariam** uma posição de `0.00012345 BTC`. |
+
+No PostgreSQL o valor é exato de ponta a ponta. No SQLite, que não tem tipo
+decimal, o SQLAlchemy grava como real e devolve `Decimal` quantizado na leitura —
+as somas em Python continuam exatas. A função `money()` normaliza `Decimal` e
+`float` na borda JSON (`jsonify` não serializa `Decimal`).
+
+### Migrações
+
+O mecanismo oficial é o **Alembic**, e o `startup.txt` o aplica antes de servir:
+
+```
+alembic upgrade head && gunicorn ... wsgi:app
+```
+
+```powershell
+alembic upgrade head        # aplica
+alembic current             # em que revisão estou
+alembic downgrade -1        # volta um passo
+alembic upgrade head --sql   # só gera o SQL, sem tocar no banco (para um DBA revisar)
+```
+
+A URL **não** fica no `alembic.ini`: `alembic/env.py` chama `resolve_db_url()`, a
+mesma resolução do aplicativo. Um valor fixo no `.ini` fazia `alembic upgrade
+head` migrar o `data.db` local quando a intenção era o banco de produção.
+
+As três revisões são idempotentes e portáveis:
+
+| Revisão | O que faz |
+| --- | --- |
+| `46d24e28829d` | Cria as quatro tabelas (nasceu com `upgrade(): pass`, o que fazia a revisão seguinte falhar com *no such table* num banco novo) |
+| `6a8a71d3da19` | Cria os índices de performance, inspecionando via `sa.inspect()` (a versão original consultava `sqlite_master`, que não existe no PostgreSQL) |
+| `8f2c41ab7d05` | Converte `FLOAT` → `NUMERIC` nas colunas monetárias |
+
+Um banco que já existia — criado pelo `create_all()` de um deploy anterior —
+atravessa as três sem erro: cada criação é protegida por inspeção, e as guardas de
+índice são separadas das de tabela (senão um banco existente nunca ganharia os
+índices novos). A conversão de tipo usa `batch_alter_table`, que é o que permite
+alterar coluna no SQLite.
+
+O `Base.metadata.create_all()` continua no boot como **rede de segurança**: o
+portal do Azure permite sobrescrever o comando de inicialização, e sem isto um
+deploy com o comando errado não criaria tabela alguma. A diferença é que agora uma
+falha de banco **derruba o boot** em vez de ser engolida — antes o aplicativo subia
+"verde", o health check passava, o Azure trocava o slot e todo request devolvia
+500.
+
+Para redefinir um banco local: apague o ficheiro e rode `alembic upgrade head`.
 
 ## Arquivos Estáticos e Frontend
 Somente o conteúdo de `static/` é servido pela web, sob `/static/<arquivo>`.
@@ -422,13 +485,16 @@ Regras acrescentadas na Fase 2:
 | **Debug** | `app.run(debug=True)` com bind `0.0.0.0` expunha o console do Werkzeug (RCE). Debug agora é opt-in via `FLASK_DEBUG` e nunca liga por padrão. |
 | **Import sem efeitos colaterais** | `backend` não cria mais o app no import: o Alembic (`from backend import Base`) deixava de abrir conexão/`create_all()`, e o `wsgi.py` não inicializa tudo duas vezes. |
 
-### Ainda pendente (Fases 3–4)
-- **Dinheiro em `Float`** e `amount` negativo/zero aceito no `POST` de transações (o `PUT` valida `> 0`).
-- **Parcelas contadas para sempre** no summary: `expenses_parcelas` soma `monthly_value` de todas as parcelas, ignorando `total_months` e o tempo decorrido.
-- **Dedup da sync ignora soft-deleted**: transação apagada volta na próxima sincronização.
-- **Fallback silencioso para `sqlite:///:memory:`** quando o engine falha.
-- **Migrações Alembic vazias** (`upgrade(): pass`) e específicas de SQLite (`sqlite_master`), com `alembic.ini` ignorando `DATABASE_URL`.
-- **Fase 4**: quebrar `create_app()` (~1.400 linhas) em blueprints, remover código morto (`open_finance.py`, `LogContext`), agregações em SQL no summary/suggestions e reescrever as seções desatualizadas deste README.
+### Ainda pendente (Fase 4)
+- **`create_app()` tem ~1.400 linhas** com todas as rotas fechadas nela: quebrar em blueprints e extrair a lógica de negócio para serviços testáveis isoladamente.
+- **Código morto**: `open_finance.py` (superseded por `providers.py`) e `LogContext` (importado, nunca usado).
+- **Filtros em transações**: `?type=expense` e filtro por período não existem, embora `/suggestions` gere ações apontando para `?type=expense` — o link volta com a listagem completa.
+- **Coluna `fingerprint` com índice único** `(user_id, fingerprint)` para a deduplicação do sync deixar de depender de varrer as transações do usuário.
+- **Marcar parcelas como concluídas** explicitamente, em vez de derivar do tempo decorrido a cada leitura.
+- **Lock completo de dependências** (`pip-compile`): hoje as transitivas (ex.: `limits`) são resolvidas no build.
+- **`requirements-dev.txt`**: `pytest`/`pytest-cov` vão para produção junto com o resto.
+- **`before_request` marca `session.permanent = True` em todo request**, inclusive anônimo e de asset estático.
+- **`FLASK_SECRET_KEY` ainda gera chave aleatória** se ausente (com log CRITICAL): em produção isso invalida sessões a cada restart. Melhor seria falhar o boot.
 
 ## Rate limiting
 
@@ -455,37 +521,88 @@ Resposta ao exceder: `429`.
 ## Validação & Erros
 Erros retornam JSON:
 ```json
-{"error": "bad_request", "details": {"amount": ["Valor inválido"]}}
+{"error": "bad_request", "details": {"amount": ["Deve ser um valor positivo (mínimo 0.01)."]}}
 ```
 
+Erros 500 nunca vazam stack trace nem configuração: devolvem
+`{"error": "internal_error", "details": "Erro interno do servidor.", "error_id": "<16 hex>"}`,
+e o `error_id` é o que permite cruzar a resposta com o log.
+
+### Regras de entrada
+
+`POST` e `PUT` usam **o mesmo schema**, então as regras são idênticas nos dois —
+antes divergiam (o `PUT` rejeitava `amount <= 0` e o `POST` aceitava).
+
+| Campo | Regra | Coluna no banco |
+| --- | --- | --- |
+| `amount`, `monthly_value` (transação/parcela) | `0.01` a `999999999999.99` | `NUMERIC(14,2)` |
+| `amount` (investimento = quantidade) | `> 0`, aceita fração (`0.00012345`) | `NUMERIC(20,8)` |
+| `purchase_price`, `current_price` | `>= 0` | `NUMERIC(20,8)` |
+| `target_return` | `-100` a `10000` (%) | `FLOAT` |
+| `description` | 1 a 255 caracteres | `String(255)` |
+| `name` | 1 a 256 caracteres | `String(256)` |
+| `notes` | até 1024 caracteres | `String(1024)` |
+| `total_months` | 1 a 1200 | `Integer` |
+| `type` | `income` \| `expense` | `String(16)` |
+| `status` (investimento) | `active` \| `sold` \| `matured` | `String(32)` |
+| `asset_type` | `stocks`, `reit`, `crypto`, `bonds`, `funds`, `savings`, `real_estate`, `commodities` | `String(64)` |
+
+Os limites espelham as colunas de propósito: sem eles o SQLite aceitava uma
+`description` de 5.000 caracteres enquanto o PostgreSQL devolveria 500 — a mesma
+requisição funcionava ou não dependendo do dialeto.
+
+Duas regras do `PUT` merecem destaque:
+
+- **Campo desconhecido → 400.** Antes era ignorado em silêncio, então um erro de
+  digitação (`ammount`) parecia ter funcionado.
+- **`user_id` não é editável.** O campo existe no schema porque o `POST` precisa
+  dele, mas a whitelist de atualização o exclui — sem isso um `PUT` transferiria o
+  registro para outra conta.
+
+### Sincronização Open Finance
+
+Um item malformado vindo do banco **não aborta mais a importação inteira** (antes
+um único item inválido devolvia 400 e nada era gravado). Ele é pulado, contado e
+registrado em log:
+
+```json
+{"imported": 3, "skipped_duplicates": 0, "skipped_invalid": 1, "transactions": [...]}
+```
+
+A deduplicação agora considera **também** as linhas com soft delete: antes o filtro
+`deleted_at IS NULL` fazia exatamente o oposto do esperado — apagar uma transação
+importada a trazia de volta na sincronização seguinte.
+
 ## Limitações Atuais
-- **Não há frontend neste repositório**: `static/` está vazio, então o redirect
-  pós-login (`POST_LOGIN_PATH`) aponta para um arquivo que ainda não existe.
-- `amount` é armazenado como `Float` e o `POST` de transações aceita valor
-  negativo/zero (o `PUT` valida `> 0`) — o summary pode ficar invertido.
-- O summary soma `monthly_value` de **todas** as parcelas, ignorando
-  `total_months` e o tempo decorrido: parcela quitada continua contando como
-  despesa mensal.
-- Listagens têm paginação, mas transações não têm filtro por período/tipo
-  (investimentos filtram por `status` e `asset_type`).
-- Agregações (summary, suggestions, portfolio) somam em Python sobre todas as
-  linhas do usuário, não em SQL.
-- Migrações Alembic são no-op e específicas de SQLite; quem cria o schema é o
-  `create_all()` no boot.
+- **Transações não têm filtro por período nem por tipo**, embora a paginação
+  exista (investimentos filtram por `status` e `asset_type`). Como `/suggestions`
+  gera ações apontando para `?type=expense`, o link volta com a listagem completa.
+- **A deduplicação do sync varre as transações do usuário** a cada sincronização,
+  em vez de usar uma coluna `fingerprint` com índice único.
+- **Parcela concluída é derivada do tempo decorrido** a cada leitura, não marcada
+  no registro.
+- **`create_app()` tem ~1.400 linhas** com todas as rotas fechadas nela, o que
+  dificulta testar a lógica de negócio isoladamente.
+- `pytest` e `pytest-cov` estão no `requirements.txt` de produção, e as
+  transitivas não têm lock completo.
 
 ## Próximos Passos Sugeridos
 1. ~~Autenticação OAuth e derivar `user_id` da sessão~~ — **feito**
 2. ~~Paginação~~ — **feito** · filtros por data/tipo em transações — pendente
-3. Marcar parcelas concluídas e considerá-las corretamente no summary
+3. ~~Considerar parcelas corretamente no summary~~ — **feito** (Fase 3) · marcar
+   parcelas concluídas no registro — pendente
 4. Exportação CSV / Excel
-5. ~~Testes automatizados~~ — **61 testes** (Fases 1 e 2); ampliar para
-   summary, suggestions e portfolio
+5. ~~Testes automatizados~~ — **144 testes** cobrindo resumo, sugestões,
+   portfólio, validação, migrações e frontend
 6. ~~Rate limiting e logging estruturado (JSON)~~ — **feito**
-7. `Numeric(14,2)` para valores monetários + migração dos dados existentes
-8. Alembic real (schema inicial portável, lendo `DATABASE_URL`) e remover o
-   `create_all()` do boot
-9. Blueprints + camada de serviço (`create_app()` tem ~1.400 linhas)
-10. Publicar o frontend em `static/`
+7. ~~`Numeric(14,2)` para valores monetários + migração dos dados existentes~~ —
+   **feito** (Fase 3, com `NUMERIC(20,8)` para quantidade/cotação de ativo)
+8. ~~Alembic real (schema inicial portável, lendo `DATABASE_URL`)~~ — **feito**
+   (Fase 3). O `create_all()` foi **mantido de propósito** como rede de segurança
+   contra um Startup Command errado no portal; o que mudou é que falha de banco
+   agora derruba o boot em vez de ser engolida.
+9. Blueprints + camada de serviço
+10. ~~Publicar o frontend em `static/`~~ — **feito** (Fase 2)
 11. Redis como `RATELIMIT_STORAGE_URI` ao escalar para mais de uma instância
 
 ## Licença
