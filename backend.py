@@ -11,19 +11,25 @@ Persistência: SQLite via SQLAlchemy.
 Serialização/validação: Marshmallow.
 """
 
-from datetime import datetime, date, UTC
+from datetime import datetime, date, timedelta, UTC
 from typing import Optional
+import hashlib
+import hmac
 import secrets
 from functools import wraps
-from datetime import timedelta
 import time
 
 from flask import Flask, jsonify, request, redirect, url_for, session
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from flask_wtf.csrf import CSRFProtect
-from sqlalchemy import create_engine, Integer, String, Float, Date, Column, DateTime, Index
+from flask_wtf.csrf import CSRFProtect, generate_csrf
+from werkzeug.middleware.proxy_fix import ProxyFix
+from decimal import Decimal
+from sqlalchemy import (
+    create_engine, Integer, String, Float, Numeric, Date, Column, DateTime,
+    Index, case, func,
+)
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 from marshmallow import Schema, fields, ValidationError, validate
 from authlib.integrations.flask_client import OAuth
@@ -37,12 +43,164 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Configuração
 # ---------------------------------------------------------------------------
+def resolve_db_url() -> str:
+    """Resolve a connection string: DATABASE_URL (Azure) → GF_DB_URL (local).
+
+    Existe como função (e não só a constante abaixo) porque o `alembic/env.py`
+    precisa re-resolver no momento da migração. Importar a constante `DB_URL`
+    congelaria o valor lido no primeiro import do módulo — dentro de um processo
+    de teste, ou de um boot que mudou o ambiente depois, a migração iria para o
+    banco errado sem nenhum aviso.
+    """
+    return os.getenv("DATABASE_URL") or os.getenv("GF_DB_URL", "sqlite:///data.db")
+
+
 # Suporta tanto DATABASE_URL (Azure) quanto GF_DB_URL (local)
-DB_URL = os.getenv("DATABASE_URL") or os.getenv("GF_DB_URL", "sqlite:///data.db")
+DB_URL = resolve_db_url()
 # Suporta tanto SECRET_KEY (Azure) quanto FLASK_SECRET_KEY (local)
-FLASK_SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
+_SECRET_KEY_CONFIGURED = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY")
+FLASK_SECRET_KEY = _SECRET_KEY_CONFIGURED or secrets.token_hex(32)
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+
+
+def env_flag(name: str, default: str = "false") -> bool:
+    """Interpreta uma variável de ambiente booleana de forma previsível.
+
+    Aceita 1/true/yes/on (case-insensitive) como verdadeiro; qualquer outro
+    valor (inclusive ausente) é falso, a menos que `default` diga o contrário.
+    """
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# Ambiente
+# ---------------------------------------------------------------------------
+# Fail-closed: na ausência de APP_ENV assumimos produção, para que recursos de
+# desenvolvimento nunca fiquem ativos por acidente num deploy.
+APP_ENV = os.getenv("APP_ENV", "production").strip().lower()
+# O Azure App Service sempre define WEBSITE_SITE_NAME; usamos como reforço para
+# que um APP_ENV errado não consiga "ligar" modo desenvolvimento na nuvem.
+IS_PRODUCTION = APP_ENV in ("production", "prod") or bool(os.getenv("WEBSITE_SITE_NAME"))
+
+# Porta dos fundos de desenvolvimento (/auth/dev-login).
+# Antes era liberada por `not OPENFINANCE_ENABLE_REAL`, cujo default é false —
+# ou seja, ficava ABERTA EM PRODUÇÃO e permitia assumir a identidade de
+# qualquer user_id. Agora exige opt-in explícito E ambiente não-produtivo.
+DEV_LOGIN_ENABLED = env_flag("ENABLE_DEV_LOGIN") and not IS_PRODUCTION
+
+# Ritmo do dev-login. O padrão (5/min) é proteção contra força bruta, mas numa
+# interface gráfica isso estoura com dois cliques e um F5 — e o usuário fica
+# trancado por um minuto achando que o login "não funciona". Configurável para
+# ambientes de demonstração/teste, onde o dev-login é o único jeito de entrar.
+DEV_LOGIN_RATE_LIMIT = os.getenv("DEV_LOGIN_RATE_LIMIT", "5 per minute")
+
+# ---------------------------------------------------------------------------
+# URLs públicas, CORS e proxy reverso
+# ---------------------------------------------------------------------------
+# Origens autorizadas a chamar a API com o cookie de sessão.
+# Antes era hardcoded em http://localhost:5000 — no Azure o navegador não
+# recebia Access-Control-Allow-Origin e nenhuma chamada do frontend funcionava.
+FRONTEND_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv(
+        "FRONTEND_ORIGINS", "http://localhost:5000,http://127.0.0.1:5000"
+    ).split(",")
+    if origin.strip()
+]
+
+# URL pública da aplicação (ex.: https://gestao.azurewebsites.net).
+# Quando ausente, derivamos do próprio request — que só sai com https:// e o
+# host certo porque aplicamos ProxyFix abaixo.
+APP_BASE_URL = (os.getenv("APP_BASE_URL") or "").strip().rstrip("/")
+
+# Destino do redirect após o callback do Google (antes: localhost:5000 fixo).
+POST_LOGIN_PATH = os.getenv("POST_LOGIN_PATH", "/static/index.html")
+
+# Quantidade de proxies reversos confiáveis na frente do app (Azure = 1).
+# Sem ProxyFix, request.remote_addr é o IP do balanceador: todos os usuários
+# caem no MESMO balde de rate limit (um abusador derruba a API para todos) e
+# url_for(_external=True) gera http:// em vez de https://.
+TRUSTED_PROXY_COUNT = max(0, int(os.getenv("TRUSTED_PROXY_COUNT", "1")))
+
+# Backend do rate limiter. memory:// vale por processo/instância: com mais de
+# uma instância no Azure, cada uma conta seu próprio limite. Use Redis
+# (ex.: redis://host:6379) se escalar horizontalmente.
+RATELIMIT_STORAGE_URI = os.getenv("RATELIMIT_STORAGE_URI", "memory://")
+
+
+def internal_path(path: str) -> str:
+    """Sanitiza um caminho para uso em redirect interno.
+
+    Rejeita URLs absolutas e protocol-relative (`//evil.com`), que
+    transformariam o redirect pós-login em open redirect.
+    """
+    path = (path or "").strip()
+    if not path.startswith("/") or path.startswith("//"):
+        return "/"
+    return path
+
+def money_type(precision: int = 14, scale: int = 2):
+    """Tipo monetário: NUMERIC(precision, scale) em qualquer dialeto.
+
+    Antes era `Float`. Somar centavos em binário acumula erro — o clássico
+    `0.1 + 0.2 != 0.3` — e o resumo financeiro do usuário é exatamente uma soma
+    longa de centavos. NUMERIC é exato no PostgreSQL e, no SQLite, o SQLAlchemy
+    quantiza o valor lido para `scale` casas e devolve Decimal, então as somas em
+    Python também ficam exatas.
+
+    Custo conhecido no SQLite: o dialeto não tem Decimal nativo, então o
+    SQLAlchemy converte float <-> Decimal e emite um SAWarning uma vez. Vale a
+    troca — dinheiro errado é pior que log ruidoso.
+
+    Nada aqui vaza para as rotas: `money()` abaixo normaliza Decimal e float para
+    o mesmo resultado na borda JSON (jsonify não serializa Decimal).
+    """
+    return Numeric(precision, scale)
+
+
+def quantity_type(precision: int = 20, scale: int = 8):
+    """Tipo para quantidades e cotações — fração importa aqui.
+
+    Diferente de `money_type()`: uma posição pode ser 0.00012345 BTC ou 0.375 de
+    uma ação fracionada, e um token pode custar 0.0000012. Arredondar isso para 2
+    casas (NUMERIC(14,2)) zeraria a posição. Por isso 8 casas decimais.
+    """
+    return Numeric(precision, scale)
+
+
+def money(value, default: float = 0.0) -> float:
+    """Converte um valor monetário do banco para float de 2 casas.
+
+    `Numeric` devolve `Decimal` no PostgreSQL e `float` no SQLite; `jsonify` não
+    serializa `Decimal` (seria 500 só em produção). Passar tudo por aqui torna os
+    dois dialetos equivalentes na borda JSON.
+    """
+    if value is None:
+        return default
+    if isinstance(value, Decimal):
+        return float(round(value, 2))
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return default
+
+
+def meses_decorridos(inicio: date, hoje: date) -> int:
+    """Meses completos entre duas datas (0 dentro do próprio mês de início)."""
+    return (hoje.year - inicio.year) * 12 + (hoje.month - inicio.month)
+
+
+def parcela_ativa(inicio, total_meses, hoje: date) -> bool:
+    """Uma compra em N parcelas ainda pesa no orçamento?
+
+    Só enquanto não termina. `total_meses <= 0` ou data ausente contam como
+    encerrada — defensivo para linhas gravadas antes desta validação existir.
+    """
+    if not inicio or not total_meses or total_meses <= 0:
+        return False
+    return meses_decorridos(inicio, hoje) < total_meses
+
 
 # CRITICAL: Defer engine creation to avoid module import failures
 # If DB_URL is invalid/unreachable, this will cause gunicorn to timeout
@@ -52,15 +210,41 @@ engine = None
 SessionLocal = None
 
 def get_engine():
+    """Cria a engine uma única vez — e falha alto se o banco estiver mal configurado.
+
+    Antes, qualquer exceção aqui caía num `sqlite:///:memory:` silencioso. O
+    efeito era o pior possível: o app subia "verde", o health check passava, o
+    usuário criava transações e **cada conexão nova começava um banco vazio** —
+    os dados evaporavam sem nenhum erro no log. Em produção isso seria
+    descoberto só depois de perder tudo.
+    """
     global engine
     if engine is None:
         try:
             engine = create_engine(DB_URL, echo=False, future=True)
         except Exception as e:
-            logger.error(f"Failed to create engine: {e}")
-            # Create a fallback in-memory SQLite for now
-            engine = create_engine("sqlite:///:memory:", echo=False, future=True)
+            # Nunca logar DB_URL: a connection string carrega a senha do banco.
+            logger.critical(
+                "Falha ao configurar o banco de dados",
+                extra={"error_code": "db_engine_failed", "exception": type(e).__name__},
+            )
+            raise RuntimeError(
+                "Não foi possível configurar o banco de dados "
+                f"({type(e).__name__}). Verifique GF_DB_URL/DATABASE_URL."
+            ) from e
     return engine
+
+def utcnow() -> datetime:
+    """Único ponto que produz "agora" no aplicativo.
+
+    Sempre em UTC. As colunas são `DateTime` sem timezone de propósito: no
+    PostgreSQL (`TIMESTAMP`) e no SQLite o valor é gravado como wall-clock UTC e
+    volta *naive*. Usar `DateTime(timezone=True)` faria o PostgreSQL devolver
+    datetime com fuso e o SQLite sem — divergência de dialeto dentro do código.
+    Regra: nunca comparar um datetime vindo do banco com um `now()` local.
+    """
+    return datetime.now(UTC)
+
 
 def get_session_local():
     global SessionLocal
@@ -81,7 +265,7 @@ class Transaction(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(String(64), index=True, nullable=False)
     description = Column(String(255), nullable=False)
-    amount = Column(Float, nullable=False)
+    amount = Column(money_type(), nullable=False)
     type = Column(String(16), nullable=False)  # income | expense
     date = Column(Date, nullable=False)
     deleted_at = Column(DateTime, nullable=True)  # Soft delete timestamp
@@ -98,7 +282,7 @@ class Installment(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(String(64), index=True, nullable=False)
     description = Column(String(255), nullable=False)
-    monthly_value = Column(Float, nullable=False)
+    monthly_value = Column(money_type(), nullable=False)
     total_months = Column(Integer, nullable=False)
     date_added = Column(Date, nullable=False)
     deleted_at = Column(DateTime, nullable=True)  # Soft delete timestamp
@@ -134,59 +318,90 @@ class Investment(Base):
     user_id = Column(String(64), index=True, nullable=False)
     name = Column(String(256), nullable=False)  # ex: "Tesla", "Fundo Imobiliário"
     asset_type = Column(String(64), nullable=False)  # stocks, reit, crypto, bonds, funds, savings, real_estate, commodities
-    amount = Column(Float, nullable=False)  # quantidade ou valor investido
-    purchase_price = Column(Float, nullable=False)  # preço de compra/cotação
-    current_price = Column(Float, nullable=True)  # preço atual
+    amount = Column(quantity_type(), nullable=False)  # quantidade (frações valem)
+    purchase_price = Column(quantity_type(), nullable=False)  # preço de compra/cotação
+    current_price = Column(quantity_type(), nullable=True)  # preço atual
     purchase_date = Column(Date, nullable=False)
     target_return = Column(Float, nullable=True)  # % de retorno esperado
     status = Column(String(32), nullable=False, default='active')  # active | sold | matured
     notes = Column(String(1024), nullable=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.now)
-    updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+    created_at = Column(DateTime, nullable=False, default=utcnow)
+    updated_at = Column(DateTime, nullable=False, default=utcnow, onupdate=utcnow)
     deleted_at = Column(DateTime, nullable=True)  # Soft delete timestamp
+
+
+# ---------------------------------------------------------------------------
+# Validação de entrada
+# ---------------------------------------------------------------------------
+# Os limites espelham as colunas do banco: NUMERIC(14,2) e String(n).
+# Sem eles o SQLite aceitava qualquer coisa (uma description de 5.000 caracteres
+# gravava sem erro) enquanto o PostgreSQL devolveria 500 — a mesma requisição
+# funcionava ou não dependendo do dialeto. E dinheiro negativo ou zero passava no
+# POST mas era rejeitado no PUT.
+MAX_DINHEIRO = 999_999_999_999.99  # 12 dígitos inteiros + 2 casas
+
+valor_positivo = validate.Range(
+    min=0.01, max=MAX_DINHEIRO,
+    error="Deve ser um valor positivo (mínimo 0.01).",
+)
+preco_nao_negativo = validate.Range(
+    min=0, max=MAX_DINHEIRO,
+    error="Não pode ser negativo.",
+)
+percentual = validate.Range(
+    min=-100, max=10000,
+    error="Percentual fora de um intervalo razoável.",
+)
+# Quantidade de um ativo: precisa aceitar frações (0.00012345 BTC, 0.375 de ação
+# fracionada). O mínimo de 0.01 usado para dinheiro zeraria essas posições.
+MAX_QUANTIDADE = 999_999_999_999.99999999  # NUMERIC(20,8)
+quantidade_positiva = validate.Range(
+    min=0.00000001, max=MAX_QUANTIDADE,
+    error="Quantidade deve ser positiva.",
+)
 
 
 class ConsentSchema(Schema):
     id = fields.Int(dump_only=True)
-    user_id = fields.Str(required=True, validate=validate.Length(min=1))
-    consent_id = fields.Str(required=True, validate=validate.Length(min=4))
-    provider = fields.Str(required=True, validate=validate.Length(min=2))
-    scopes = fields.Str(required=True)
+    user_id = fields.Str(required=True, validate=validate.Length(min=1, max=64))
+    consent_id = fields.Str(required=True, validate=validate.Length(min=4, max=128))
+    provider = fields.Str(required=True, validate=validate.Length(min=2, max=64))
+    scopes = fields.Str(required=True, validate=validate.Length(max=512))
     status = fields.Str(required=True, validate=validate.OneOf(["active", "revoked", "expired"]))
     created_at = fields.DateTime(dump_only=True)
 
 
 class InvestmentSchema(Schema):
     id = fields.Int(dump_only=True)
-    user_id = fields.Str(required=True, validate=validate.Length(min=1))
-    name = fields.Str(required=True, validate=validate.Length(min=1))
+    user_id = fields.Str(required=True, validate=validate.Length(min=1, max=64))
+    name = fields.Str(required=True, validate=validate.Length(min=1, max=256))
     asset_type = fields.Str(required=True, validate=validate.OneOf(["stocks", "reit", "crypto", "bonds", "funds", "savings", "real_estate", "commodities"]))
-    amount = fields.Float(required=True)
-    purchase_price = fields.Float(required=True)
-    current_price = fields.Float(allow_none=True)
+    amount = fields.Float(required=True, validate=quantidade_positiva)
+    purchase_price = fields.Float(required=True, validate=preco_nao_negativo)
+    current_price = fields.Float(allow_none=True, validate=preco_nao_negativo)
     purchase_date = fields.Date(required=True)
-    target_return = fields.Float(allow_none=True)
+    target_return = fields.Float(allow_none=True, validate=percentual)
     status = fields.Str(required=True, validate=validate.OneOf(["active", "sold", "matured"]))
-    notes = fields.Str(allow_none=True)
+    notes = fields.Str(allow_none=True, validate=validate.Length(max=1024))
     created_at = fields.DateTime(dump_only=True)
     updated_at = fields.DateTime(dump_only=True)
 
 
 class TransactionSchema(Schema):
     id = fields.Int(dump_only=True)
-    user_id = fields.Str(required=True, validate=validate.Length(min=1))
-    description = fields.Str(required=True, validate=validate.Length(min=1))
-    amount = fields.Float(required=True)
+    user_id = fields.Str(required=True, validate=validate.Length(min=1, max=64))
+    description = fields.Str(required=True, validate=validate.Length(min=1, max=255))
+    amount = fields.Float(required=True, validate=valor_positivo)
     type = fields.Str(required=True, validate=validate.OneOf(["income", "expense"]))
     date = fields.Date(required=True)
 
 
 class InstallmentSchema(Schema):
     id = fields.Int(dump_only=True)
-    user_id = fields.Str(required=True, validate=validate.Length(min=1))
-    description = fields.Str(required=True, validate=validate.Length(min=1))
-    monthly_value = fields.Float(required=True)
-    total_months = fields.Int(required=True)
+    user_id = fields.Str(required=True, validate=validate.Length(min=1, max=64))
+    description = fields.Str(required=True, validate=validate.Length(min=1, max=255))
+    monthly_value = fields.Float(required=True, validate=valor_positivo)
+    total_months = fields.Int(required=True, validate=validate.Range(min=1, max=1200))
     date_added = fields.Date(required=True)
 
 
@@ -201,28 +416,78 @@ consents_schema = ConsentSchema(many=True)
 
 
 def create_app() -> Flask:
-    # Serve arquivos estáticos (ex.: index_api.html) a partir da raiz do projeto
-    app = Flask(__name__, static_url_path='', static_folder='.')
+    # Arquivos estáticos servidos SOMENTE a partir de ./static.
+    # Antes: static_folder='.' expunha pela web qualquer arquivo da raiz do
+    # projeto (verificado: GET /backend.py, GET /.env e GET /.git/config
+    # respondiam 200). Se houver frontend, coloque os arquivos em static/.
+    app = Flask(__name__, static_url_path="/static", static_folder="static")
     app.secret_key = FLASK_SECRET_KEY
-    
-    # CORS com suporte a credenciais
-    CORS(app, supports_credentials=True, origins=["http://localhost:5000", "http://127.0.0.1:5000"])
 
-    # Rate Limiting (CRITICAL: Previne brute force e DDoS)
+    if IS_PRODUCTION and not _SECRET_KEY_CONFIGURED:
+        # Não derrubamos o app (isso quebraria deploys já existentes), mas o
+        # aviso é crítico: sem SECRET_KEY fixa cada worker/instância/restart
+        # gera uma chave nova e invalida todas as sessões.
+        logger.critical(
+            "SECRET_KEY/FLASK_SECRET_KEY não configurada em produção: sessões "
+            "serão invalidadas a cada restart e divergirão entre workers",
+            extra={"error_code": "secret_key_missing"},
+        )
+
+    # Proxy reverso (Azure App Service sempre coloca um na frente do gunicorn).
+    # Precisa vir ANTES de qualquer coisa que use request.remote_addr / scheme.
+    if TRUSTED_PROXY_COUNT > 0:
+        app.wsgi_app = ProxyFix(
+            app.wsgi_app,
+            x_for=TRUSTED_PROXY_COUNT,
+            x_proto=TRUSTED_PROXY_COUNT,
+            x_host=TRUSTED_PROXY_COUNT,
+        )
+
+    # CORS com credenciais: origens vêm de FRONTEND_ORIGINS
+    CORS(app, supports_credentials=True, origins=FRONTEND_ORIGINS)
+
+    # Rate limiting.
+    # Antes: default_limits=["200 per day", "50 per hour"] valia para TODAS as
+    # rotas — inclusive /api/health e cada arquivo estático. Verificado na main:
+    # 55 chamadas seguidas ao health check já devolviam 429, o que faz o Azure
+    # marcar a app como indisponível e um frontend que carrega N assets estourar
+    # a cota do dia.
+    # Agora: default folgado, rotas de infraestrutura isentas e limites rígidos
+    # concentrados em autenticação e escrita.
+    app.config["RATELIMIT_ENABLED"] = env_flag("RATELIMIT_ENABLED", "true")
     limiter = Limiter(
         app=app,
         key_func=get_remote_address,
-        default_limits=["200 per day", "50 per hour"],
-        storage_uri="memory://"
+        default_limits=["500 per hour", "5000 per day"],
+        storage_uri=RATELIMIT_STORAGE_URI,
     )
-    
-    # CSRF Protection (CRITICAL: Previne Cross-Site Request Forgery)
+    # Assets estáticos não consomem cota de API: uma única página pode pedir
+    # N arquivos e cada um contaria como requisição.
+    limiter.exempt(app.view_functions["static"])
+
+    # CSRF — política uniforme.
+    # Regra: toda rota que muda estado (POST/PUT/PATCH/DELETE) exige o token
+    # retornado por GET /api/csrf-token, enviado no header X-CSRFToken.
+    # Únicas isenções (documentadas no próprio decorador):
+    #   - /api/openfinance/webhook: chamado por serviço externo, autenticado por HMAC
+    #   - /auth/dev-login: só existe fora de produção e o chamador ainda não tem sessão
+    # GET/HEAD/OPTIONS nunca exigem token (WTF_CSRF_METHODS).
+    app.config.update(
+        # None = o token vive o mesmo tempo da sessão. O default de 3600s expirava
+        # antes dos 120min de sessão e quebrava formulários deixados abertos.
+        WTF_CSRF_TIME_LIMIT=None,
+        # Default do Flask-WTF (True); exposto aqui para permitir desligar quando
+        # houver cliente de API não-navegador (sem header Referer) em HTTPS.
+        WTF_CSRF_SSL_STRICT=env_flag("WTF_CSRF_SSL_STRICT", "true"),
+    )
     csrf = CSRFProtect(app)
 
     # Configuração de cookies/sessão (controlada por .env)
+    # SESSION_COOKIE_SECURE assume "true" em produção (fail-closed): o Azure
+    # serve HTTPS, então o cookie de sessão nunca deve trafegar em claro.
     app.config.update(
-        SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true",
-        SESSION_COOKIE_HTTPONLY=os.getenv("SESSION_COOKIE_HTTPONLY", "true").lower() == "true",
+        SESSION_COOKIE_SECURE=env_flag("SESSION_COOKIE_SECURE", "true" if IS_PRODUCTION else "false"),
+        SESSION_COOKIE_HTTPONLY=env_flag("SESSION_COOKIE_HTTPONLY", "true"),
         SESSION_COOKIE_SAMESITE=os.getenv("SESSION_COOKIE_SAMESITE", "Lax"),
         PERMANENT_SESSION_LIFETIME=timedelta(minutes=int(os.getenv("SESSION_LIFETIME_MINUTES", "120")))
     )
@@ -231,20 +496,81 @@ def create_app() -> Flask:
     def _permanent_session():
         session.permanent = True
 
+    # -------------------------------------------------------------------
+    # Ciclo de vida da sessão de banco
+    # -------------------------------------------------------------------
+    @app.teardown_appcontext
+    def shutdown_db_session(exception=None):
+        """Devolve/encerra a sessão do scoped_session ao fim de CADA request.
+
+        Sem isto (situação anterior), o scoped_session ficava preso à thread do
+        worker sync e era reutilizado pelo request seguinte. Consequência
+        reproduzida na main: um request que falhava no meio deixava objetos
+        pendentes que o PRÓXIMO request commitava — um registro "órfão" de uma
+        requisição abortada aparecia no banco junto com dados legítimos.
+        Também não havia rollback, então qualquer erro de banco deixava a sessão
+        em PendingRollbackError e quebrava todas as requisições seguintes da
+        thread até o restart do worker.
+        """
+        if SessionLocal is None:
+            return  # request não tocou no banco (ex.: estático, health)
+        try:
+            if exception is not None:
+                SessionLocal.rollback()
+        except Exception:  # rollback não pode mascarar o erro original
+            logger.warning("Rollback da sessão no teardown falhou", exc_info=True,
+                           extra={"error_code": "teardown_rollback_failed"})
+        finally:
+            # remove() é o que garante o essencial: fecha a sessão, descarta
+            # objetos pendentes (add() ou setattr não commitados) e devolve a
+            # conexão ao pool. Vale também para exceções tratadas por
+            # errorhandler — nesse caso o Flask chama o teardown com None.
+            SessionLocal.remove()
+
     # Endpoint para obter CSRF token (para chamadas AJAX)
     @app.route('/api/csrf-token', methods=['GET'])
+    @limiter.exempt  # chamado no carregamento de toda página
     def get_csrf_token():
-        """Retorna CSRF token para cliente usar em requisições POST/PUT/DELETE."""
-        return jsonify({"csrf_token": session.get('_csrf_token', 'N/A')}), 200
+        """Retorna o token CSRF que o cliente deve enviar no header X-CSRFToken.
 
-    # Cria tabelas se não existirem (usando engine lazy-loaded)
+        Antes lia `session['_csrf_token']`, chave que o Flask-WTF nunca grava
+        (a correta é `csrf_token`, de WTF_CSRF_FIELD_NAME) e jamais chamava
+        generate_csrf() — o endpoint devolvia sempre "N/A" e nenhuma rota de
+        escrita conseguia ser usada (PUT/DELETE de transações e todo o CRUD de
+        parcelas respondiam 400 "The CSRF token is missing.").
+        """
+        return jsonify({
+            "csrf_token": generate_csrf(),
+            "header_name": "X-CSRFToken",
+        }), 200
+
+    # Cria as tabelas se não existirem.
+    #
+    # Rede de segurança, não o mecanismo principal: o `startup.txt` roda
+    # `alembic upgrade head` antes do gunicorn, mas o portal do Azure permite
+    # sobrescrever o comando de inicialização — sem isto, um deploy com o comando
+    # errado não criaria tabela alguma.
+    #
+    # O que mudou na Fase 3: a exceção NÃO é mais engolida. O `except` anterior
+    # registrava "Failed to create database tables" e seguia em frente ("App will
+    # still start, just without database"). Na prática: o health check passava, o
+    # Azure trocava o slot e TODO request devolvia 500 — uma falha total de
+    # serviço anunciada como deploy bem-sucedido. Sem banco o aplicativo não serve
+    # para nada, então o boot falha e o deploy é rejeitado.
+    db_engine = get_engine()
     try:
-        db_engine = get_engine()
         Base.metadata.create_all(db_engine)
         logger.info("Database tables created successfully")
     except Exception as e:
-        logger.error(f"Failed to create database tables: {e}")
-        # App will still start, just without database
+        # Nunca logar a connection string: ela carrega a senha do banco.
+        logger.critical(
+            "Falha ao preparar o esquema do banco",
+            extra={"error_code": "db_schema_failed", "exception": type(e).__name__},
+        )
+        raise RuntimeError(
+            "Não foi possível preparar o esquema do banco de dados "
+            f"({type(e).__name__}). Verifique GF_DB_URL/DATABASE_URL."
+        ) from e
     
     # Configurar OAuth
     oauth = OAuth(app)
@@ -285,11 +611,33 @@ def create_app() -> Flask:
             raise RuntimeError("Database session not initialized")
         return session_factory()
 
-    def parse_json(schema: Schema, payload: dict):
+    def parse_json(schema: Schema, payload: dict, partial: bool = False):
         try:
-            return schema.load(payload)
+            return schema.load(payload, partial=partial)
         except ValidationError as err:
             raise BadRequest(err.messages)
+
+    def apply_update(obj, schema: Schema, payload: dict, campos: tuple):
+        """Valida um payload parcial com o MESMO schema do POST e aplica só o permitido.
+
+        Substitui os blocos `for field in [...]` com `try/except` que cada PUT
+        tinha. As regras viviam em dois lugares e divergiam: o POST aceitava
+        `amount <= 0` e o PUT rejeitava; `description` sem limite de tamanho num
+        e com `strptime` manual no outro. Agora a fonte de verdade é o schema.
+
+        Dois detalhes de segurança/robustez:
+        - `campos` é uma whitelist. `user_id` fica de fora de propósito: sem isso,
+          enviar o campo no body transferiria o registro para outra conta.
+        - campo desconhecido vira 400 (default do Marshmallow é `unknown=RAISE`).
+          Antes era ignorado em silêncio — o formulário de edição de investimento
+          mandava `asset_type`, `amount`, `purchase_price` e `purchase_date`, o
+          PUT descartava os quatro e respondia 200 como se tivesse salvado.
+        """
+        dados = parse_json(schema, payload, partial=True)
+        for campo in campos:
+            if campo in dados:
+                setattr(obj, campo, dados[campo])
+        return dados
 
     def today_date() -> date:
         return date.today()
@@ -371,30 +719,99 @@ def create_app() -> Flask:
         return jsonify({"error": "not_found", "details": e.message}), 404
 
     from werkzeug.exceptions import HTTPException
+
+    @app.errorhandler(ValidationError)
+    def handle_validation_error(e: ValidationError) -> tuple:
+        """Marshmallow ValidationError fora de `parse_json` -> 400.
+
+        Antes escapava como 500 `internal_error` com as mensagens internas do
+        schema no corpo da resposta (ex.: POST /openfinance/consents).
+        """
+        return jsonify({"error": "bad_request", "details": e.messages}), 400
+
     @app.errorhandler(Exception)
     def handle_generic(e: Exception) -> tuple:
         # Evita transformar 404/405 etc em 500
         if isinstance(e, HTTPException):
             return jsonify({"error": e.name.lower().replace(' ', '_'), "details": e.description}), e.code
-        return jsonify({"error": "internal_error", "details": str(e)}), 500
+        # Nunca devolver `str(e)` ao cliente: mensagens de driver de banco,
+        # strings de conexão e detalhes de configuração vazavam na resposta.
+        # O detalhe vai para o log, correlacionado por `error_id`.
+        error_id = secrets.token_hex(8)
+        try:
+            context = {
+                "endpoint": request.path,
+                "method": request.method,
+                "user_id": (session.get("user") or {}).get("id"),
+            }
+        except Exception:  # fora de um request context
+            context = {}
+        logger.error(
+            "Erro interno não tratado",
+            exc_info=e,
+            extra={**context, "error_code": error_id},
+        )
+        return jsonify({
+            "error": "internal_error",
+            "details": "Erro interno do servidor.",
+            "error_id": error_id,
+        }), 500
 
     # -------------------------------------------------------------------
     # Health
     # -------------------------------------------------------------------
     @app.route("/api/health")
-    @csrf.exempt  # GET não requer CSRF
+    @limiter.exempt  # health probe do Azure: não pode consumir cota nem levar 429
     def health():
         return jsonify({"status": "ok"})
 
     @app.route("/")
-    @require_auth
-    @csrf.exempt  # GET não requer CSRF
+    @limiter.exempt  # entrada da aplicação: não pode consumir cota nem levar 429
     def root():
-        return jsonify({"message": "Gestor Financeiro API", "health": "/api/health"}), 200
+        """Raiz serve o frontend.
+
+        Antes era `@require_auth` devolvendo um JSON de descoberta da API, então
+        abrir a aplicação no navegador sem sessão respondia **401** — justamente a
+        primeira coisa que alguém vê ao acessar a URL. O frontend tem sua própria
+        tela de login e cada chamada de API continua protegida por sessão + CSRF,
+        então a raiz precisa ser pública.
+
+        A descoberta da API mudou para `/api`.
+        """
+        return app.send_static_file("index.html")
+
+    @app.route("/api")
+    @limiter.exempt
+    def api_index():
+        """Descoberta da API (o que a raiz devolvia antes)."""
+        return jsonify({
+            "message": "Gestor Financeiro API",
+            "ui": "/",
+            "health": "/api/health",
+            "csrf_token": "/api/csrf-token",
+            "auth": "/auth/me",
+        }), 200
 
     # -------------------------------------------------------------------
     # Autenticação Google OAuth
     # -------------------------------------------------------------------
+    @app.route("/auth/methods")
+    @limiter.exempt  # consultado a cada carga de página, antes de haver sessão
+    def auth_methods():
+        """Quais formas de entrar estão disponíveis.
+
+        Sem isso o frontend não tem como saber se deve oferecer o login sem
+        Google: ele ou mostrava o botão escondido num `<details>` (e o usuário
+        não achava), ou tentava e levava `403 dev_login_disabled` sem entender.
+        Público de propósito — não revela segredo nenhum: diz apenas se o OAuth
+        está configurado e se o dev-login está liberado neste ambiente.
+        """
+        return jsonify({
+            "google": bool(google),
+            "dev_login": bool(app.config.get("TESTING") or DEV_LOGIN_ENABLED),
+            "producao": IS_PRODUCTION,
+        }), 200
+
     @app.route("/auth/login")
     @limiter.limit("5 per minute")  # CRITICAL: Protege contra brute force
     def login():
@@ -407,6 +824,7 @@ def create_app() -> Flask:
         return google.authorize_redirect(redirect_uri)
 
     @app.route("/auth/callback")
+    @limiter.limit("10 per minute")  # protege o callback contra tentativas em força bruta
     def auth_callback():
         """Callback do Google OAuth."""
         if not google:
@@ -424,13 +842,29 @@ def create_app() -> Flask:
                     'picture': user_info.get('picture')
                 }
                 logger.info("Login bem-sucedido", extra={"user_id": user_id, "endpoint": "/auth/callback", "method": "GET"})
-                # Redirecionar para frontend
-                return redirect('http://localhost:5000/index_api.html?logged=true')
+                # Redirect pós-login.
+                # Antes: URL absoluta hardcoded para o frontend em localhost,
+                # apontando para um index_api.html que nem existe no repositório
+                # — no Azure jogava o usuário para a própria máquina. Agora a
+                # base vem de APP_BASE_URL (ou do próprio request, que sai
+                # correto graças ao ProxyFix) e o caminho é sanitizado contra
+                # open redirect.
+                base = APP_BASE_URL or request.url_root.rstrip("/")
+                return redirect(f"{base}{internal_path(POST_LOGIN_PATH)}?logged=true")
             logger.warning("Informações de usuário não obtidas", extra={"endpoint": "/auth/callback", "error_code": "no_user_info"})
             return jsonify({"error": "Falha ao obter informações do usuário"}), 400
         except Exception as e:
-            logger.error("Erro no callback OAuth", extra={"endpoint": "/auth/callback", "error_code": "oauth_error", "exception": str(e)})
-            return jsonify({"error": str(e)}), 400
+            # Detalhe só no log: `str(e)` do Authlib expunha state/nonce e
+            # erros internos do fluxo OAuth ao cliente.
+            logger.error(
+                "Erro no callback OAuth",
+                exc_info=e,
+                extra={"endpoint": "/auth/callback", "method": "GET", "error_code": "oauth_error"},
+            )
+            return jsonify({
+                "error": "oauth_callback_failed",
+                "details": "Não foi possível concluir o login com o Google.",
+            }), 400
 
     @app.route("/auth/logout")
     def logout():
@@ -441,31 +875,60 @@ def create_app() -> Flask:
         return jsonify({"message": "Logout realizado"}), 200
 
     @app.route("/auth/dev-login", methods=['POST'])
-    @csrf.exempt
+    @csrf.exempt  # isenção documentada: existe só fora de produção e o chamador ainda não tem sessão/token
+    @limiter.limit(DEV_LOGIN_RATE_LIMIT)  # é um endpoint de login: limita tentativa em força bruta
     def dev_login():
         """
         Endpoint de login para desenvolvimento (SEM OAuth).
         POST /auth/dev-login
         Body: {"user_id": "test_user", "email": "test@example.com", "name": "Test User"}
+
+        SEGURANÇA: desativado por padrão. Só responde quando
+        `ENABLE_DEV_LOGIN=true` E o ambiente não é produção
+        (`APP_ENV != production` e sem `WEBSITE_SITE_NAME`). Em testes
+        (`app.config['TESTING']`) também é liberado.
+
+        Antes a condição era `not OPENFINANCE_ENABLE_REAL`, cujo default é
+        false — ou seja, a porta dos fundos ficava aberta em produção e
+        permitia a qualquer pessoa assumir a sessão de um `user_id` arbitrário
+        (inclusive o `sub` do Google de um usuário real) e ler/alterar os dados
+        financeiros dele.
         """
-        if app.config.get('TESTING') or not use_real_openfinance:
-            data = request.get_json() or {}
-            user_id = data.get('user_id', 'test_user')
-            email = data.get('email', f'{user_id}@example.com')
-            name = data.get('name', 'Test User')
-            
-            session['user'] = {
-                'id': user_id,
-                'email': email,
-                'name': name,
-                'picture': None
-            }
-            logger.info(f"Dev login realizado para {user_id}")
+        if not (app.config.get('TESTING') or DEV_LOGIN_ENABLED):
+            logger.warning(
+                "Tentativa de dev-login com o recurso desativado",
+                extra={
+                    "endpoint": "/auth/dev-login",
+                    "method": "POST",
+                    "error_code": "dev_login_disabled",
+                },
+            )
             return jsonify({
-                "message": "Login de desenvolvimento bem-sucedido",
-                "user": session['user']
-            }), 200
-        return jsonify({"error": "Dev login apenas disponível em ambiente de desenvolvimento"}), 403
+                "error": "dev_login_disabled",
+                "details": "Login de desenvolvimento desativado. "
+                           "Defina ENABLE_DEV_LOGIN=true apenas em ambiente local.",
+            }), 403
+
+        data = request.get_json(silent=True) or {}
+        # Limita tamanho dos campos para não gravar lixo arbitrário na sessão.
+        user_id = str(data.get('user_id') or 'test_user').strip()[:64] or 'test_user'
+        email = str(data.get('email') or f'{user_id}@example.com').strip()[:254]
+        name = str(data.get('name') or 'Test User').strip()[:120]
+
+        session['user'] = {
+            'id': user_id,
+            'email': email,
+            'name': name,
+            'picture': None
+        }
+        logger.info(
+            "Dev login realizado",
+            extra={"user_id": user_id, "endpoint": "/auth/dev-login", "method": "POST"},
+        )
+        return jsonify({
+            "message": "Login de desenvolvimento bem-sucedido",
+            "user": session['user']
+        }), 200
 
     @app.route("/auth/me")
     def get_current_user():
@@ -483,7 +946,6 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/openfinance/consents", methods=["POST"])
     @require_auth
-    @csrf.exempt  # Desabilitado para desenvolvimento
     @limiter.limit("20 per hour")  # IMPORTANT: Limita criação de consents
     def create_consent(user_id: str):
         payload = request.get_json(silent=True) or {}
@@ -496,15 +958,18 @@ def create_app() -> Flask:
         if not payload.get('status'):
             payload['status'] = 'active'
         payload['user_id'] = user_id
-        data = consent_schema.load(payload)
+        # parse_json (e não schema.load direto): ValidationError vira 400
+        # padronizado. E o objeto é montado a partir do resultado VALIDADO,
+        # não do payload cru — antes a validação era descartada.
+        data = parse_json(consent_schema, payload)
         session_db = get_session()
         obj = Consent(
-            user_id=payload.get('user_id', ''),
-            consent_id=payload.get('consent_id', ''),
-            provider=payload.get('provider', ''),
-            scopes=payload.get('scopes', ''),
-            status=payload.get('status', ''),
-            created_at=datetime.now(UTC)
+            user_id=data['user_id'],
+            consent_id=data['consent_id'],
+            provider=data['provider'],
+            scopes=data['scopes'],
+            status=data['status'],
+            created_at=utcnow()
         )
         session_db.add(obj)
         session_db.commit()
@@ -512,7 +977,6 @@ def create_app() -> Flask:
 
     @app.route("/api/users/<user_id>/openfinance/consents", methods=["GET"])
     @require_auth
-    @csrf.exempt  # GET não requer CSRF
     def list_consents(user_id: str):
         session_db = get_session()
         query = session_db.query(Consent).filter(
@@ -543,11 +1007,10 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/transactions", methods=["GET"])
     @require_auth
-    @csrf.exempt  # GET não requer CSRF
     def list_transactions(user_id: str):
         # Query base - filtrar apenas registros não deletados
-        session = get_session()
-        query = session.query(Transaction).filter(
+        session_db = get_session()
+        query = session_db.query(Transaction).filter(
             Transaction.user_id == user_id,
             Transaction.deleted_at.is_(None)
         ).order_by(Transaction.date.desc())
@@ -572,25 +1035,26 @@ def create_app() -> Flask:
 
     @app.route("/api/users/<user_id>/transactions", methods=["POST"])
     @require_auth
-    @csrf.exempt  # Desabilitado para desenvolvimento
     @limiter.limit("100 per hour")  # IMPORTANT: Limita criação de transações
     def create_transaction(user_id: str):
         payload = request.get_json(silent=True) or {}
         payload["user_id"] = user_id
         if "date" not in payload:
             payload["date"] = today_date().isoformat()
+        # Usa o resultado VALIDADO: antes o objeto era montado a partir do
+        # payload cru, jogando fora a coerção do Marshmallow e duplicando o
+        # parse de data com um strptime manual.
         data = parse_json(transaction_schema, payload)
-        session = get_session()
-        # Construir Transaction com campos explícitos
+        session_db = get_session()
         txn = Transaction(
-            user_id=payload.get('user_id'),
-            description=payload.get('description'),
-            amount=payload.get('amount'),
-            type=payload.get('type'),
-            date=datetime.strptime(payload.get('date', ''), '%Y-%m-%d').date() if payload.get('date') else today_date()
+            user_id=data['user_id'],
+            description=data['description'],
+            amount=data['amount'],
+            type=data['type'],
+            date=data['date'],  # fields.Date já devolve datetime.date
         )
-        session.add(txn)
-        session.commit()
+        session_db.add(txn)
+        session_db.commit()
         return jsonify(transaction_schema.dump(txn)), 201
 
     @app.route("/api/users/<user_id>/transactions/<int:txn_id>", methods=["PUT", "PATCH"])
@@ -598,45 +1062,26 @@ def create_app() -> Flask:
     @limiter.limit("100 per hour")  # IMPORTANT: Limita atualizações
     def update_transaction(user_id: str, txn_id: int):
         payload = request.get_json(silent=True) or {}
-        session = get_session()
-        txn: Optional[Transaction] = session.query(Transaction).filter(
+        session_db = get_session()
+        txn: Optional[Transaction] = session_db.query(Transaction).filter(
             Transaction.id == txn_id,
             Transaction.user_id == user_id,
             Transaction.deleted_at.is_(None)
         ).first()
         if not txn:
             raise NotFound("Transação não encontrada")
-        # Campos permitidos
-        for field in ["description", "amount", "type", "date"]:
-            if field in payload:
-                if field == "amount":
-                    try:
-                        val = float(payload[field])
-                        if val <= 0:
-                            raise ValueError
-                        setattr(txn, field, val)
-                    except Exception:
-                        raise BadRequest({"amount": ["Valor inválido"]})
-                elif field == "date":
-                    try:
-                        setattr(txn, field, datetime.strptime(payload[field], "%Y-%m-%d").date())
-                    except Exception:
-                        raise BadRequest({"date": ["Formato deve ser YYYY-MM-DD"]})
-                elif field == "type":
-                    if payload[field] not in ["income", "expense"]:
-                        raise BadRequest({"type": ["Deve ser income ou expense"]})
-                    setattr(txn, field, payload[field])
-                else:
-                    setattr(txn, field, payload[field])
-        session.commit()
+        # Mesmas regras do POST (schema) e só estes campos são editáveis.
+        apply_update(txn, transaction_schema, payload,
+                     ("description", "amount", "type", "date"))
+        session_db.commit()
         return jsonify(transaction_schema.dump(txn))
 
     @app.route("/api/users/<user_id>/transactions/<int:txn_id>", methods=["DELETE"])
     @require_auth
     @limiter.limit("100 per hour")  # IMPORTANT: Limita exclusões
     def delete_transaction(user_id: str, txn_id: int):
-        session = get_session()
-        txn = session.query(Transaction).filter(
+        session_db = get_session()
+        txn = session_db.query(Transaction).filter(
             Transaction.id == txn_id,
             Transaction.user_id == user_id,
             Transaction.deleted_at.is_(None)
@@ -644,8 +1089,8 @@ def create_app() -> Flask:
         if not txn:
             raise NotFound("Transação não encontrada")
         # Soft delete: set deleted_at timestamp
-        txn.deleted_at = datetime.now(UTC)
-        session.commit()
+        txn.deleted_at = utcnow()
+        session_db.commit()
         return jsonify({"deleted": txn_id})
 
     # -------------------------------------------------------------------
@@ -653,7 +1098,6 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/suggestions", methods=["GET"])
     @require_auth
-    @csrf.exempt  # GET não requer CSRF
     @limiter.limit("50 per hour")
     def get_suggestions(user_id: str):
         """
@@ -662,9 +1106,13 @@ def create_app() -> Flask:
         """
         session_db = get_session()
         
-        # Buscar transações dos últimos 30 dias
+        # Buscar transações dos últimos 30 dias.
+        # Projeção de colunas: a análise usa só tipo, descrição e valor. Carregar o
+        # objeto ORM inteiro traz o resto das colunas de cada linha sem necessidade.
         thirty_days_ago = today_date() - timedelta(days=30)
-        recent_txns = session_db.query(Transaction).filter(
+        recent_txns = session_db.query(
+            Transaction.type, Transaction.description, Transaction.amount
+        ).filter(
             Transaction.user_id == user_id,
             Transaction.deleted_at.is_(None),
             Transaction.date >= thirty_days_ago
@@ -683,16 +1131,17 @@ def create_app() -> Flask:
             })
             return jsonify({"suggestions": suggestions})
         
-        # Calcular estatísticas
-        total_income = sum(float(t.amount) for t in recent_txns if t.type == "income")
-        total_expense = sum(float(t.amount) for t in recent_txns if t.type == "expense")
-        balance = total_income - total_expense
+        # Calcular estatísticas. money() normaliza Decimal (PostgreSQL) e float
+        # (SQLite) para a mesma coisa na borda JSON.
+        total_income = money(sum(a for t, _, a in recent_txns if t == "income"))
+        total_expense = money(sum(a for t, _, a in recent_txns if t == "expense"))
+        balance = money(total_income - total_expense)
         
         # Análise por descrição (categorias informais)
         expense_categories = {}
-        for txn in recent_txns:
-            if txn.type == "expense":
-                desc = txn.description.lower()
+        for tipo, descricao, valor in recent_txns:
+            if tipo == "expense":
+                desc = (descricao or "").lower()
                 # Categorizar por palavras-chave
                 if any(word in desc for word in ['restaurante', 'ifood', 'uber eats', 'almoço', 'jantar', 'lanche']):
                     category = 'alimentacao'
@@ -707,7 +1156,9 @@ def create_app() -> Flask:
                 else:
                     category = 'outros'
                 
-                expense_categories[category] = expense_categories.get(category, 0) + float(txn.amount)
+                expense_categories[category] = (
+                    expense_categories.get(category, 0.0) + float(valor or 0)
+                )
         
         # SUGESTÃO 1: Saldo negativo
         if balance < 0:
@@ -816,7 +1267,6 @@ def create_app() -> Flask:
         priority_order = {"high": 0, "medium": 1, "low": 2}
         suggestions.sort(key=lambda x: priority_order.get(x.get("priority", "low"), 2))
         
-        session_db.close()
         
         return jsonify({
             "suggestions": suggestions,
@@ -838,10 +1288,9 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/installments", methods=["GET"])
     @require_auth
-    @csrf.exempt  # GET não requer CSRF
     def list_installments(user_id: str):
-        session = get_session()
-        query = session.query(Installment).filter(
+        session_db = get_session()
+        query = session_db.query(Installment).filter(
             Installment.user_id == user_id,
             Installment.deleted_at.is_(None)
         ).order_by(Installment.date_added.desc())
@@ -873,10 +1322,10 @@ def create_app() -> Flask:
         if "date_added" not in payload:
             payload["date_added"] = today_date().isoformat()
         data = parse_json(installment_schema, payload)
-        session = get_session()
+        session_db = get_session()
         inst = Installment(**data)
-        session.add(inst)
-        session.commit()
+        session_db.add(inst)
+        session_db.commit()
         return jsonify(installment_schema.dump(inst)), 201
 
     @app.route("/api/users/<user_id>/installments/<int:inst_id>", methods=["PUT", "PATCH"])
@@ -884,48 +1333,26 @@ def create_app() -> Flask:
     @limiter.limit("100 per hour")  # IMPORTANT: Limita atualizações de parcelas
     def update_installment(user_id: str, inst_id: int):
         payload = request.get_json(silent=True) or {}
-        session = get_session()
-        inst: Optional[Installment] = session.query(Installment).filter(
+        session_db = get_session()
+        inst: Optional[Installment] = session_db.query(Installment).filter(
             Installment.id == inst_id,
             Installment.user_id == user_id,
             Installment.deleted_at.is_(None)
         ).first()
         if not inst:
             raise NotFound("Parcela não encontrada")
-        for field in ["description", "monthly_value", "total_months", "date_added"]:
-            if field in payload:
-                if field in ["monthly_value"]:
-                    try:
-                        val = float(payload[field])
-                        if val <= 0:
-                            raise ValueError
-                        setattr(inst, field, val)
-                    except Exception:
-                        raise BadRequest({field: ["Valor inválido"]})
-                elif field in ["total_months"]:
-                    try:
-                        val = int(payload[field])
-                        if val <= 0:
-                            raise ValueError
-                        setattr(inst, field, val)
-                    except Exception:
-                        raise BadRequest({field: ["Inteiro positivo"]})
-                elif field == "date_added":
-                    try:
-                        setattr(inst, field, datetime.strptime(payload[field], "%Y-%m-%d").date())
-                    except Exception:
-                        raise BadRequest({field: ["Formato deve ser YYYY-MM-DD"]})
-                else:
-                    setattr(inst, field, payload[field])
-        session.commit()
+        # Mesmas regras do POST (schema) e só estes campos são editáveis.
+        apply_update(inst, installment_schema, payload,
+                     ("description", "monthly_value", "total_months", "date_added"))
+        session_db.commit()
         return jsonify(installment_schema.dump(inst))
 
     @app.route("/api/users/<user_id>/installments/<int:inst_id>", methods=["DELETE"])
     @require_auth
     @limiter.limit("100 per hour")  # IMPORTANT: Limita exclusões de parcelas
     def delete_installment(user_id: str, inst_id: int):
-        session = get_session()
-        inst = session.query(Installment).filter(
+        session_db = get_session()
+        inst = session_db.query(Installment).filter(
             Installment.id == inst_id,
             Installment.user_id == user_id,
             Installment.deleted_at.is_(None)
@@ -933,8 +1360,8 @@ def create_app() -> Flask:
         if not inst:
             raise NotFound("Parcela não encontrada")
         # Soft delete: set deleted_at timestamp
-        inst.deleted_at = datetime.now(UTC)
-        session.commit()
+        inst.deleted_at = utcnow()
+        session_db.commit()
         return jsonify({"deleted": inst_id})
 
     # -------------------------------------------------------------------
@@ -942,36 +1369,53 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/summary", methods=["GET"])
     @require_auth
-    @csrf.exempt  # GET não requer CSRF
     def summary(user_id: str):
-        session = get_session()
-        # Filtrar apenas registros não deletados
-        txns = session.query(Transaction).filter(
-            Transaction.user_id == user_id,
-            Transaction.deleted_at.is_(None)
-        ).all()
-        insts = session.query(Installment).filter(
+        session_db = get_session()
+
+        # Somas feitas no banco (SUM + GROUP BY) em vez de carregar todas as
+        # linhas e somar em Python: o custo deixa de crescer com o histórico.
+        por_tipo = dict(
+            session_db.query(
+                Transaction.type,
+                func.coalesce(func.sum(Transaction.amount), 0),
+            ).filter(
+                Transaction.user_id == user_id,
+                Transaction.deleted_at.is_(None),
+            ).group_by(Transaction.type).all()
+        )
+        income = money(por_tipo.get("income"))
+        expenses_avulsa = money(por_tipo.get("expense"))
+
+        # Parcelas: só as que AINDA estão sendo pagas. Antes o resumo somava todas
+        # as parcelas cadastradas para sempre — uma compra em 12x feita há três
+        # anos continuava pesando no orçamento do mês.
+        # A aritmética de meses é por linha (cada compra tem sua data de início) e
+        # não é portável entre SQLite e PostgreSQL, então projetamos só as três
+        # colunas necessárias e filtramos aqui, sem carregar objeto ORM inteiro.
+        hoje = today_date()
+        parcelas = session_db.query(
+            Installment.monthly_value,
+            Installment.date_added,
+            Installment.total_months,
+        ).filter(
             Installment.user_id == user_id,
-            Installment.deleted_at.is_(None)
+            Installment.deleted_at.is_(None),
         ).all()
-        # Calcular somas iterando sobre objetos ORM
-        income = 0.0
-        expenses_avulsa = 0.0
-        for t in txns:
-            amt = float(t.amount) if t.amount else 0.0
-            if t.type and t.type == "income":
-                income += amt
-            elif t.type and t.type == "expense":
-                expenses_avulsa += amt
-        expenses_parcelas = sum(float(i.monthly_value) if i.monthly_value else 0.0 for i in insts) if insts else 0.0
-        expenses_total = float(expenses_avulsa) + float(expenses_parcelas)
-        balance = float(income) - float(expenses_total)
+        ativas = [
+            mv for mv, inicio, total in parcelas if parcela_ativa(inicio, total, hoje)
+        ]
+        expenses_parcelas = money(sum(ativas)) if ativas else 0.0
+
+        expenses_total = money(expenses_avulsa + expenses_parcelas)
+        balance = money(income - expenses_total)
         return jsonify({
-            "income": round(income, 2),
-            "expenses_avulsa": round(expenses_avulsa, 2),
-            "expenses_parcelas": round(expenses_parcelas, 2),
-            "expenses_total": round(expenses_total, 2),
-            "balance": round(balance, 2)
+            "income": income,
+            "expenses_avulsa": expenses_avulsa,
+            "expenses_parcelas": expenses_parcelas,
+            "expenses_total": expenses_total,
+            "balance": balance,
+            "parcelas_ativas": len(ativas),
+            "parcelas_encerradas": len(parcelas) - len(ativas),
         })
 
     # -------------------------------------------------------------------
@@ -981,7 +1425,7 @@ def create_app() -> Flask:
     @require_auth
     @limiter.limit("20 per hour")  # IMPORTANT: Limita importações
     def import_data(user_id: str):
-        session = get_session()
+        session_db = get_session()
         hoje_str = today_date().isoformat()
         simulated = [
             {"description": "Transferência Recebida (Freelancer)", "amount": 1500.00, "type": "income", "date": hoje_str},
@@ -992,9 +1436,9 @@ def create_app() -> Flask:
         for item in simulated:
             data = parse_json(transaction_schema, {**item, "user_id": user_id})
             txn = Transaction(**data)
-            session.add(txn)
+            session_db.add(txn)
             created.append(txn)
-        session.commit()
+        session_db.commit()
         return jsonify({
             "status": "success",
             "imported": len(created),
@@ -1006,7 +1450,6 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/openfinance/sync", methods=["POST"])
     @require_auth
-    @csrf.exempt  # Desabilitado para desenvolvimento
     @limiter.limit("10 per hour")  # IMPORTANT: Limita sync para economizar banda
     def open_finance_sync(user_id: str):
         """Sincroniza transações via Open Finance."""
@@ -1035,44 +1478,99 @@ def create_app() -> Flask:
                 # SimulatedProvider usa assinatura antiga (sem consent_id)
                 result = provider.sync(local_user_id=user_id)
         except Exception as e:
-            logger.error("Erro na sincronização Open Finance", extra={"user_id": user_id, "error": str(e)})
-            return jsonify({"error": "sync_failed", "details": str(e)}), 500
+            logger.error(
+                "Erro na sincronização Open Finance",
+                exc_info=e,
+                extra={"user_id": user_id, "endpoint": "/openfinance/sync", "error_code": "sync_failed"},
+            )
+            # `str(e)` vazava configuração interna do provider
+            # (ex.: "Configurações faltantes: OPENFINANCE_CLIENT_SECRET").
+            return jsonify({
+                "error": "sync_failed",
+                "details": "Falha na sincronização com o Open Finance.",
+            }), 500
         
         inserted = []
         skipped = 0
+        invalidos = 0
 
-        # Pré-carrega transações existentes do usuário para deduplicação (apenas não deletadas)
-        existing = session_db.query(Transaction).filter(
-            Transaction.user_id == user_id,
-            Transaction.deleted_at.is_(None)
-        ).all()
-        def fingerprint(d: dict) -> str:
-            return f"{d['date']}|{d['type']}|{d['amount']:.2f}|{d['description'].strip().lower()}"
-        existing_fp = {fingerprint({
-            'date': t.date.isoformat(),
-            'type': t.type,
-            'amount': t.amount,
-            'description': t.description
-        }) for t in existing}
+        def fingerprint(data_, tipo, valor, descricao) -> Optional[str]:
+            """Assinatura estável de uma transação, ou None se faltar dado essencial.
 
-        for tx in result["transactions"]:
-            fp = fingerprint(tx)
-            if fp in existing_fp:
+            Antes era `f"{d['date']}|{d['type']}|{d['amount']:.2f}|..."` com índice
+            direto: um provider que omitisse qualquer um dos campos derrubava o
+            endpoint inteiro com KeyError (500), e um `amount` que não fosse número
+            estourava no format. Agora nada aqui lança — o item inválido é pulado.
+            """
+            if isinstance(data_, datetime):
+                dia = data_.date().isoformat()
+            elif isinstance(data_, date):
+                dia = data_.isoformat()
+            else:
+                dia = str(data_ or "").strip()[:10]
+            if not dia or not tipo:
+                return None
+            return (
+                f"{dia}|{str(tipo).strip().lower()}|"
+                f"{money(valor):.2f}|{str(descricao or '').strip().lower()}"
+            )
+
+        # Deduplicação contra TUDO que o usuário já tem, inclusive linhas com soft
+        # delete. O filtro `deleted_at IS NULL` que estava aqui fazia o oposto do
+        # esperado: apagar uma transação importada a trazia de volta no sync
+        # seguinte, já que ela deixava de constar entre as existentes.
+        existentes = session_db.query(
+            Transaction.date, Transaction.type,
+            Transaction.amount, Transaction.description,
+        ).filter(Transaction.user_id == user_id).all()
+        existing_fp = set()
+        for linha in existentes:
+            fp = fingerprint(*linha)
+            if fp:
+                existing_fp.add(fp)
+
+        for tx in (result.get("transactions") or []):
+            if not isinstance(tx, dict):
+                invalidos += 1
+                continue
+            fp = fingerprint(
+                tx.get("date"), tx.get("type"), tx.get("amount"), tx.get("description")
+            )
+            if fp and fp in existing_fp:
                 skipped += 1
                 continue
-            data = parse_json(transaction_schema, {**tx, "user_id": user_id})
+            try:
+                data = transaction_schema.load({**tx, "user_id": user_id})
+            except ValidationError as err:
+                # Um item malformado do banco não pode abortar a importação inteira
+                # (era o que acontecia: parse_json lançava BadRequest e o sync
+                # devolvia 400 sem gravar nada).
+                invalidos += 1
+                logger.warning(
+                    "Item inválido ignorado na sincronização Open Finance",
+                    extra={
+                        "user_id": user_id, "endpoint": "/openfinance/sync",
+                        "error_code": "sync_item_invalid",
+                        "fields": sorted(err.messages),
+                    },
+                )
+                continue
             obj = Transaction(**data)
             session_db.add(obj)
             inserted.append(obj)
-            existing_fp.add(fp)
+            if fp:
+                existing_fp.add(fp)
         session_db.commit()
         duration_ms = (time.time() - start_time) * 1000
-        logger.info("Sincronização Open Finance concluída", extra={"user_id": user_id, "endpoint": "/openfinance/sync", "imported": len(inserted), "skipped": skipped, "duration_ms": round(duration_ms, 2)})
+        logger.info("Sincronização Open Finance concluída", extra={"user_id": user_id, "endpoint": "/openfinance/sync", "imported": len(inserted), "skipped": skipped, "invalid": invalidos, "duration_ms": round(duration_ms, 2)})
         return jsonify({
             "status": "success",
             "source": result.get("source"),
             "imported": len(inserted),
             "skipped_duplicates": skipped,
+            # Novo: itens que o provider mandou mas não passaram na validação.
+            # Antes um único item assim abortava o sync inteiro com 400.
+            "skipped_invalid": invalidos,
             "transactions": transactions_schema.dump(inserted),
         }), 201
 
@@ -1081,7 +1579,6 @@ def create_app() -> Flask:
     # -------------------------------------------------------------------
     @app.route("/api/users/<user_id>/investments", methods=["GET"])
     @require_auth
-    @csrf.exempt  # GET não requer CSRF
     @limiter.limit("100 per hour")
     def list_investments(user_id: str):
         """Lista investimentos do usuário com paginação."""
@@ -1103,7 +1600,6 @@ def create_app() -> Flask:
         
         query = query.order_by(Investment.purchase_date.desc())
         paginated = paginate_query(query, page, per_page)
-        session_db.close()
         
         return jsonify({
             "items": investments_schema.dump(paginated["items"]),
@@ -1117,7 +1613,6 @@ def create_app() -> Flask:
 
     @app.route("/api/users/<user_id>/investments", methods=["POST"])
     @require_auth
-    @csrf.exempt  # Desabilitado para desenvolvimento
     @limiter.limit("100 per hour")  # Limita criação de investimentos
     def create_investment(user_id: str):
         """Cria novo investimento."""
@@ -1136,12 +1631,10 @@ def create_app() -> Flask:
         session_db.add(inv)
         session_db.commit()
         result = investment_schema.dump(inv)
-        session_db.close()
         return jsonify(result), 201
 
     @app.route("/api/users/<user_id>/investments/<int:inv_id>", methods=["PUT", "PATCH"])
     @require_auth
-    @csrf.exempt  # Desabilitado para desenvolvimento
     @limiter.limit("100 per hour")
     def update_investment(user_id: str, inv_id: int):
         """Atualiza investimento existente."""
@@ -1155,39 +1648,23 @@ def create_app() -> Flask:
         if not inv:
             raise NotFound("Investimento não encontrado")
         
-        # Campos permitidos para update
-        for field in ["name", "current_price", "target_return", "status", "notes"]:
-            if field in payload:
-                if field == "current_price":
-                    try:
-                        val = float(payload[field])
-                        if val < 0:
-                            raise ValueError
-                        setattr(inv, field, val)
-                    except Exception:
-                        raise BadRequest({field: ["Valor inválido"]})
-                elif field == "target_return":
-                    try:
-                        val = float(payload[field])
-                        setattr(inv, field, val)
-                    except Exception:
-                        raise BadRequest({field: ["Valor inválido"]})
-                elif field == "status":
-                    if payload[field] not in ["active", "sold", "matured"]:
-                        raise BadRequest({field: ["Status inválido"]})
-                    setattr(inv, field, payload[field])
-                else:
-                    setattr(inv, field, payload[field])
-        
-        inv.updated_at = datetime.now(UTC)
+        # Antes só 5 campos eram aceitos aqui: name, current_price,
+        # target_return, status e notes. O formulário de edição do frontend envia
+        # também asset_type, amount, purchase_price e purchase_date — que eram
+        # descartados em silêncio enquanto a resposta 200 dizia que salvou.
+        # Agora todos os campos de negócio são editáveis, validados pelo schema.
+        apply_update(inv, investment_schema, payload, (
+            "name", "asset_type", "amount", "purchase_price", "current_price",
+            "purchase_date", "target_return", "status", "notes",
+        ))
+
+        inv.updated_at = utcnow()
         session_db.commit()
         result = investment_schema.dump(inv)
-        session_db.close()
         return jsonify(result)
 
     @app.route("/api/users/<user_id>/investments/<int:inv_id>", methods=["DELETE"])
     @require_auth
-    @csrf.exempt  # Desabilitado para desenvolvimento
     @limiter.limit("100 per hour")
     def delete_investment(user_id: str, inv_id: int):
         """Deleta investimento (soft delete)."""
@@ -1200,27 +1677,42 @@ def create_app() -> Flask:
         if not inv:
             raise NotFound("Investimento não encontrado")
         
-        inv.deleted_at = datetime.now(UTC)
+        inv.deleted_at = utcnow()
         session_db.commit()
-        session_db.close()
         return jsonify({"deleted": inv_id})
 
     @app.route("/api/users/<user_id>/investments/portfolio", methods=["GET"])
     @require_auth
-    @csrf.exempt  # GET não requer CSRF
     @limiter.limit("50 per hour")
     def get_portfolio_analysis(user_id: str):
         """Análise detalhada do portfólio de investimentos."""
         session_db = get_session()
-        
-        investments = session_db.query(Investment).filter(
+
+        filtro = (
             Investment.user_id == user_id,
             Investment.deleted_at.is_(None),
-            Investment.status == "active"
-        ).all()
-        
-        if not investments:
-            session_db.close()
+            Investment.status == "active",
+        )
+
+        # Valor investido = quantidade x preço de compra.
+        # Valor atual usa a cotação corrente; quando ela não existe (ou é zero, que
+        # esta API sempre tratou como "cotação desconhecida") cai no valor
+        # investido — mesmo comportamento de antes, agora expresso em SQL.
+        investido = Investment.amount * Investment.purchase_price
+        atual = case(
+            (func.coalesce(Investment.current_price, 0) == 0, investido),
+            else_=Investment.amount * Investment.current_price,
+        )
+
+        # Agregação no banco. Antes carregávamos todas as posições para somar em
+        # Python; agora são duas consultas cujo custo não cresce com o portfólio.
+        total_posicoes, soma_investido, soma_atual = session_db.query(
+            func.count(Investment.id),
+            func.coalesce(func.sum(investido), 0),
+            func.coalesce(func.sum(atual), 0),
+        ).filter(*filtro).one()
+
+        if not total_posicoes:
             return jsonify({
                 "portfolio": {
                     "total_invested": 0,
@@ -1238,42 +1730,38 @@ def create_app() -> Flask:
                     }
                 ]
             })
-        
-        # Calcular estatísticas
-        total_invested = 0
-        current_value = 0
+
+        por_tipo = session_db.query(
+            Investment.asset_type,
+            func.count(Investment.id),
+            func.coalesce(func.sum(investido), 0),
+            func.coalesce(func.sum(atual), 0),
+        ).filter(*filtro).group_by(Investment.asset_type).all()
+
+        # money() normaliza Decimal (PostgreSQL, NUMERIC) e float (SQLite) para o
+        # mesmo tipo — jsonify não serializa Decimal, e sem isso o endpoint daria
+        # 500 apenas em produção.
+        total_invested = money(soma_investido)
+        current_value = money(soma_atual)
+
         by_asset_type = {}
-        
-        for inv in investments:
-            invested = float(inv.amount) * float(inv.purchase_price) if inv.purchase_price else 0
-            current = float(inv.amount) * float(inv.current_price) if inv.current_price else invested
-            
-            total_invested += invested
-            current_value += current
-            
-            # Agrupar por tipo de ativo
-            asset_type = inv.asset_type
-            if asset_type not in by_asset_type:
-                by_asset_type[asset_type] = {
-                    "invested": 0,
-                    "current_value": 0,
-                    "count": 0,
-                    "return_percentage": 0
-                }
-            
-            by_asset_type[asset_type]["invested"] += invested
-            by_asset_type[asset_type]["current_value"] += current
-            by_asset_type[asset_type]["count"] += 1
-        
-        # Calcular retorno percentual por tipo
-        for asset_type in by_asset_type:
-            if by_asset_type[asset_type]["invested"] > 0:
-                ret = (by_asset_type[asset_type]["current_value"] - by_asset_type[asset_type]["invested"]) / by_asset_type[asset_type]["invested"] * 100
-                by_asset_type[asset_type]["return_percentage"] = round(ret, 2)
-        
-        total_return = current_value - total_invested
-        return_percentage = (total_return / total_invested * 100) if total_invested > 0 else 0
-        
+        for asset_type, quantidade, inv_bruto, cur_bruto in por_tipo:
+            inv_valor = money(inv_bruto)
+            cur_valor = money(cur_bruto)
+            by_asset_type[asset_type] = {
+                "invested": inv_valor,
+                "current_value": cur_valor,
+                "count": quantidade,
+                "return_percentage": round(
+                    (cur_valor - inv_valor) / inv_valor * 100, 2
+                ) if inv_valor > 0 else 0,
+            }
+
+        total_return = money(current_value - total_invested)
+        return_percentage = round(
+            total_return / total_invested * 100, 2
+        ) if total_invested > 0 else 0
+
         # Gerar recomendações
         recommendations = []
         
@@ -1319,7 +1807,6 @@ def create_app() -> Flask:
                 "priority": "medium"
             })
         
-        session_db.close()
         
         return jsonify({
             "portfolio": {
@@ -1333,13 +1820,12 @@ def create_app() -> Flask:
                     "count": v["count"],
                     "return_percentage": v["return_percentage"]
                 } for k, v in by_asset_type.items()},
-                "count": len(investments)
+                "count": total_posicoes
             },
             "recommendations": recommendations
         })
 
     @app.route("/api/investments/tips", methods=["GET"])
-    @csrf.exempt  # GET não requer CSRF
     @limiter.limit("50 per hour")
     def get_investment_tips():
         """Dicas e conselhos sobre investimentos."""
@@ -1506,27 +1992,47 @@ def create_app() -> Flask:
         - account.updated: Dados da conta foram atualizados
         """
         start_time = time.time()
-        
-        # Validar assinatura do webhook (se configurado)
+
+        # Fail-closed: sem OPENFINANCE_WEBHOOK_SECRET o endpoint fica
+        # DESATIVADO. Antes a verificação era condicional (`if webhook_secret:`),
+        # então na ausência do segredo qualquer pessoa podia enviar
+        # {"event": "consent.revoked", "consent_id": "..."} e revogar/expirar
+        # consentimentos de terceiros.
         webhook_secret = os.getenv("OPENFINANCE_WEBHOOK_SECRET")
-        if webhook_secret:
-            signature = request.headers.get("X-Webhook-Signature")
-            if not signature:
-                logger.warning("Webhook sem assinatura recebido", extra={"endpoint": "/openfinance/webhook"})
-                return jsonify({"error": "missing_signature"}), 401
-            
-            # Verificar assinatura HMAC
-            import hmac
-            import hashlib
-            expected_signature = hmac.new(
-                webhook_secret.encode(),
-                request.get_data(),
-                hashlib.sha256
-            ).hexdigest()
-            
-            if not hmac.compare_digest(signature, expected_signature):
-                logger.warning("Webhook com assinatura inválida", extra={"endpoint": "/openfinance/webhook"})
-                return jsonify({"error": "invalid_signature"}), 401
+        if not webhook_secret:
+            logger.error(
+                "Webhook Open Finance recebido sem OPENFINANCE_WEBHOOK_SECRET configurado",
+                extra={"endpoint": "/openfinance/webhook", "error_code": "webhook_not_configured"},
+            )
+            return jsonify({
+                "error": "webhook_not_configured",
+                "details": "Recepção de webhooks desativada por falta de configuração.",
+            }), 503
+
+        signature = (request.headers.get("X-Webhook-Signature") or "").strip()
+        if not signature:
+            logger.warning(
+                "Webhook sem assinatura recebido",
+                extra={"endpoint": "/openfinance/webhook", "error_code": "missing_signature"},
+            )
+            return jsonify({"error": "missing_signature"}), 401
+
+        # Aceita tanto "<hex>" quanto "sha256=<hex>".
+        if signature.lower().startswith("sha256="):
+            signature = signature.split("=", 1)[1].strip()
+
+        expected_signature = hmac.new(
+            webhook_secret.encode(),
+            request.get_data(),
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(signature.lower(), expected_signature.lower()):
+            logger.warning(
+                "Webhook com assinatura inválida",
+                extra={"endpoint": "/openfinance/webhook", "error_code": "invalid_signature"},
+            )
+            return jsonify({"error": "invalid_signature"}), 401
         
         try:
             payload = request.get_json()
@@ -1546,8 +2052,10 @@ def create_app() -> Flask:
                 "consent_id": consent_id
             })
             
-            # Usar sessão do banco
-            db = SessionLocal()
+            # Usar sessão do banco (get_session_local() inicializa sob demanda;
+            # o global SessionLocal ainda é None se o webhook for a 1ª rota
+            # chamada após o boot, o que causava TypeError -> 500).
+            db = get_session_local()()
             try:
                 # Buscar consentimento
                 consent = db.query(Consent).filter(
@@ -1615,16 +2123,52 @@ def create_app() -> Flask:
                 db.close()
                 
         except Exception as e:
-            logger.error("Erro ao processar webhook", extra={
-                "endpoint": "/openfinance/webhook",
-                "error": str(e)
-            })
-            return jsonify({"error": "webhook_processing_failed", "details": str(e)}), 500
+            logger.error(
+                "Erro ao processar webhook",
+                exc_info=e,
+                extra={"endpoint": "/openfinance/webhook", "error_code": "webhook_processing_failed"},
+            )
+            # `str(e)` vazava detalhes internos (mesma classe de problema
+            # corrigida nos demais handlers na Fase 1).
+            return jsonify({
+                "error": "webhook_processing_failed",
+                "details": "Falha ao processar o webhook.",
+            }), 500
 
     return app
 
 
-app = create_app()
+# Observação: NÃO criar `app = create_app()` em nível de módulo.
+# - `alembic/env.py` faz `from backend import Base`: com o app criado no import,
+#   cada migração disparava create_all() e abria conexão com o banco.
+# - `wsgi.py` chama create_app() explicitamente: o import criava um segundo app
+#   a cada boot (tabelas, provider e Limiter inicializados duas vezes — dava
+#   para ver a duplicidade nos logs de startup).
+_APP_SOB_DEMANDA = None
+
+
+def __getattr__(name: str):
+    """Shim de compatibilidade (PEP 562): `backend.app` continua existindo para
+    quem referencia `backend:app` (gunicorn / flask --app), mas o app só é
+    criado no primeiro acesso — nunca no import.
+
+    O entrypoint canônico continua sendo `wsgi:app` (ver startup.txt).
+    """
+    global _APP_SOB_DEMANDA
+    if name == "app":
+        if _APP_SOB_DEMANDA is None:
+            _APP_SOB_DEMANDA = create_app()
+        return _APP_SOB_DEMANDA
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # O modo debug do Werkzeug, combinado com bind em 0.0.0.0, expunha o console
+    # interativo (execução remota de código) para qualquer um que alcançasse a
+    # porta 5000 — e o README manda rodar exatamente `python backend.py`.
+    # Agora o debug é opt-in via FLASK_DEBUG e nunca fica ligado por padrão.
+    create_app().run(
+        host=os.getenv("FLASK_RUN_HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "5000")),
+        debug=env_flag("FLASK_DEBUG"),
+    )

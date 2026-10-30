@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gestor Financeiro</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <!-- ============================================================
+       Tela de login (exibida quando /auth/me responde 401)
+       ============================================================ -->
+  <section id="tela-login" class="tela-login oculto">
+    <div class="cartao-login">
+      <h1>Gestor Financeiro</h1>
+      <p class="subtitulo">Controle de receitas, despesas, parcelas e investimentos.</p>
+
+      <!-- Revelado só se GOOGLE_CLIENT_ID/SECRET estiverem configurados.
+           Começa oculto para não piscar um botão que este servidor não oferece. -->
+      <a id="btn-google" class="botao botao-primario botao-largo oculto" href="/auth/login">
+        Entrar com Google
+      </a>
+
+      <!-- Login sem Google. Antes vivia escondido num <details> rotulado
+           "apenas desenvolvimento": quem precisava entrar não achava. Agora é um
+           painel de primeira classe, mostrado quando /auth/methods confirma que
+           está liberado neste ambiente. -->
+      <div id="painel-dev-login" class="dev-login oculto">
+        <h2 id="titulo-dev-login">Entrar sem Google</h2>
+        <p class="dica" id="dica-dev-login">
+          Escolha um nome de usuário. Ele identifica seus dados e fica salvo só na
+          sua sessão — não existe senha.
+        </p>
+        <label class="rotulo" for="dev-user">Usuário</label>
+        <input id="dev-user" type="text" placeholder="ex.: maria" value="dev"
+               autocomplete="username" spellcheck="false">
+        <button id="btn-dev-login" class="botao botao-secundario botao-largo">Entrar</button>
+      </div>
+
+      <p id="login-erro" class="erro oculto"></p>
+      <p id="login-aviso" class="dica oculto"></p>
+      <!-- Visível só enquanto a entrada automática está em curso: evita que a
+           tela de login pisque antes de o painel abrir sozinho. -->
+      <p id="login-carregando" class="dica oculto">Entrando…</p>
+    </div>
+  </section>
+
+  <!-- ============================================================
+       Aplicação
+       ============================================================ -->
+  <div id="app" class="oculto">
+    <header class="topo">
+      <div class="usuario">
+        <img id="usuario-avatar" alt="" class="avatar oculto">
+        <div>
+          <strong id="usuario-nome">—</strong>
+          <span id="usuario-email" class="subtexto"></span>
+        </div>
+      </div>
+      <nav class="abas" id="abas">
+        <button class="aba ativa" data-aba="painel">Painel</button>
+        <button class="aba" data-aba="transacoes">Transações</button>
+        <button class="aba" data-aba="parcelas">Parcelas</button>
+        <button class="aba" data-aba="investimentos">Investimentos</button>
+        <button class="aba" data-aba="openfinance">Open Finance</button>
+      </nav>
+      <button id="btn-logout" class="botao botao-fantasma">Sair</button>
+    </header>
+
+    <main>
+      <!-- ---------------- Painel ---------------- -->
+      <section class="painel" data-painel="painel">
+        <div class="cartoes-resumo" id="cartoes-resumo">
+          <div class="cartao"><span class="rotulo">Receitas</span><strong id="res-income" data-valor>—</strong></div>
+          <div class="cartao"><span class="rotulo">Despesas avulsas</span><strong id="res-avulsa" data-valor>—</strong></div>
+          <div class="cartao"><span class="rotulo">Parcelas ativas</span><strong id="res-parcelas" data-valor>—</strong></div>
+          <div class="cartao cartao-destaque"><span class="rotulo">Saldo</span><strong id="res-balance" data-valor>—</strong></div>
+        </div>
+
+        <div class="duas-colunas">
+          <article class="bloco">
+            <h2>Sugestões</h2>
+            <div id="lista-sugestoes" class="lista-cartoes"><p class="vazio">Carregando…</p></div>
+          </article>
+          <article class="bloco">
+            <h2>Portfólio</h2>
+            <div id="resumo-portfolio"><p class="vazio">Carregando…</p></div>
+          </article>
+        </div>
+      </section>
+
+      <!-- ---------------- Transações ---------------- -->
+      <section class="painel oculto" data-painel="transacoes">
+        <article class="bloco">
+          <h2>Nova transação</h2>
+          <form id="form-transacao" class="formulario" autocomplete="off">
+            <input type="hidden" name="id">
+            <label>Descrição
+              <input name="description" required maxlength="255" placeholder="Ex.: Supermercado">
+            </label>
+            <label>Valor (R$)
+              <input name="amount" type="number" step="0.01" min="0.01" required placeholder="0,00">
+            </label>
+            <label>Tipo
+              <select name="type" required>
+                <option value="expense">Despesa</option>
+                <option value="income">Receita</option>
+              </select>
+            </label>
+            <label>Data
+              <input name="date" type="date">
+            </label>
+            <div class="acoes-form">
+              <button type="submit" class="botao botao-primario" id="btn-transacao-salvar">Adicionar</button>
+              <button type="button" class="botao botao-fantasma oculto" id="btn-transacao-cancelar">Cancelar edição</button>
+            </div>
+          </form>
+          <p class="erro oculto" data-erro="transacao"></p>
+        </article>
+
+        <article class="bloco">
+          <div class="cabecalho-bloco">
+            <h2>Transações</h2>
+            <button class="botao botao-secundario" id="btn-importar">Importar extrato simulado</button>
+          </div>
+          <div class="tabela-wrap">
+            <table class="tabela">
+              <thead>
+                <tr><th>Data</th><th>Descrição</th><th class="num">Valor</th><th>Tipo</th><th></th></tr>
+              </thead>
+              <tbody id="corpo-transacoes"></tbody>
+            </table>
+          </div>
+          <div class="paginacao" id="pag-transacoes"></div>
+        </article>
+      </section>
+
+      <!-- ---------------- Parcelas ---------------- -->
+      <section class="painel oculto" data-painel="parcelas">
+        <article class="bloco">
+          <h2>Nova compra parcelada</h2>
+          <form id="form-parcela" class="formulario" autocomplete="off">
+            <input type="hidden" name="id">
+            <label>Descrição
+              <input name="description" required maxlength="255" placeholder="Ex.: Notebook">
+            </label>
+            <label>Valor da parcela (R$)
+              <input name="monthly_value" type="number" step="0.01" min="0.01" required>
+            </label>
+            <label>Nº de parcelas
+              <input name="total_months" type="number" min="1" step="1" required>
+            </label>
+            <label>Início
+              <input name="date_added" type="date">
+            </label>
+            <div class="acoes-form">
+              <button type="submit" class="botao botao-primario" id="btn-parcela-salvar">Adicionar</button>
+              <button type="button" class="botao botao-fantasma oculto" id="btn-parcela-cancelar">Cancelar edição</button>
+            </div>
+          </form>
+          <p class="erro oculto" data-erro="parcela"></p>
+        </article>
+
+        <article class="bloco">
+          <h2>Parcelas</h2>
+          <div class="tabela-wrap">
+            <table class="tabela">
+              <thead>
+                <tr><th>Início</th><th>Descrição</th><th class="num">Parcela</th><th class="num">Meses</th><th>Situação</th><th></th></tr>
+              </thead>
+              <tbody id="corpo-parcelas"></tbody>
+            </table>
+          </div>
+          <div class="paginacao" id="pag-parcelas"></div>
+        </article>
+      </section>
+
+      <!-- ---------------- Investimentos ---------------- -->
+      <section class="painel oculto" data-painel="investimentos">
+        <article class="bloco">
+          <h2>Novo investimento</h2>
+          <form id="form-investimento" class="formulario" autocomplete="off">
+            <input type="hidden" name="id">
+            <label>Nome
+              <input name="name" required maxlength="256" placeholder="Ex.: Tesla">
+            </label>
+            <label>Tipo
+              <select name="asset_type" required>
+                <option value="stocks">Ações</option>
+                <option value="reit">Fundo imobiliário</option>
+                <option value="funds">Fundo</option>
+                <option value="bonds">Renda fixa</option>
+                <option value="savings">Poupança</option>
+                <option value="crypto">Cripto</option>
+                <option value="real_estate">Imóvel</option>
+                <option value="commodities">Commodities</option>
+              </select>
+            </label>
+            <label>Quantidade
+              <input name="amount" type="number" step="any" min="0" required>
+            </label>
+            <label>Preço de compra
+              <input name="purchase_price" type="number" step="0.01" min="0" required>
+            </label>
+            <label>Preço atual
+              <input name="current_price" type="number" step="0.01" min="0">
+            </label>
+            <label>Data da compra
+              <input name="purchase_date" type="date">
+            </label>
+            <label>Retorno alvo (%)
+              <input name="target_return" type="number" step="any">
+            </label>
+            <label>Situação
+              <select name="status" required>
+                <option value="active">Ativo</option>
+                <option value="sold">Vendido</option>
+                <option value="matured">Vencido</option>
+              </select>
+            </label>
+            <label class="largo">Observações
+              <input name="notes" maxlength="1024">
+            </label>
+            <div class="acoes-form">
+              <button type="submit" class="botao botao-primario" id="btn-investimento-salvar">Adicionar</button>
+              <button type="button" class="botao botao-fantasma oculto" id="btn-investimento-cancelar">Cancelar edição</button>
+            </div>
+          </form>
+          <p class="erro oculto" data-erro="investimento"></p>
+        </article>
+
+        <article class="bloco">
+          <div class="cabecalho-bloco">
+            <h2>Investimentos</h2>
+            <div class="filtros">
+              <select id="filtro-asset-type">
+                <option value="">Todos os tipos</option>
+                <option value="stocks">Ações</option>
+                <option value="reit">FII</option>
+                <option value="funds">Fundos</option>
+                <option value="bonds">Renda fixa</option>
+                <option value="savings">Poupança</option>
+                <option value="crypto">Cripto</option>
+                <option value="real_estate">Imóvel</option>
+                <option value="commodities">Commodities</option>
+              </select>
+              <select id="filtro-status">
+                <option value="">Todas as situações</option>
+                <option value="active">Ativo</option>
+                <option value="sold">Vendido</option>
+                <option value="matured">Vencido</option>
+              </select>
+            </div>
+          </div>
+          <div class="tabela-wrap">
+            <table class="tabela">
+              <thead>
+                <tr><th>Compra</th><th>Nome</th><th>Tipo</th><th class="num">Qtd</th><th class="num">Preço</th><th class="num">Atual</th><th class="num">Retorno</th><th></th></tr>
+              </thead>
+              <tbody id="corpo-investimentos"></tbody>
+            </table>
+          </div>
+          <div class="paginacao" id="pag-investimentos"></div>
+        </article>
+      </section>
+
+      <!-- ---------------- Open Finance ---------------- -->
+      <section class="painel oculto" data-painel="openfinance">
+        <article class="bloco">
+          <h2>Sincronização</h2>
+          <p class="dica">
+            A sync exige um consentimento <code>active</code>. Sem ele a API responde
+            <code>400 no_active_consent</code>. Transações duplicadas são ignoradas pela
+            impressão digital <code>data|tipo|valor|descrição</code>.
+          </p>
+          <div class="acoes-form">
+            <button class="botao botao-secundario" id="btn-novo-consent">Criar consentimento</button>
+            <button class="botao botao-primario" id="btn-sync">Sincronizar agora</button>
+          </div>
+          <p class="erro oculto" data-erro="openfinance"></p>
+          <p class="sucesso oculto" data-sucesso="openfinance"></p>
+        </article>
+
+        <article class="bloco">
+          <h2>Consentimentos</h2>
+          <div class="tabela-wrap">
+            <table class="tabela">
+              <thead>
+                <tr><th>Criado em</th><th>consent_id</th><th>Provider</th><th>Escopos</th><th>Status</th></tr>
+              </thead>
+              <tbody id="corpo-consents"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <div id="toast" class="toast oculto"></div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

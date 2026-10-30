@@ -1,0 +1,37 @@
+{
+  "APP_ENV": "production",
+
+  "FLASK_SECRET_KEY": "TROQUE_cofre-ou-valor-aleatorio-64-chars",
+  "GOOGLE_CLIENT_ID": "TROQUE_seu-client-id.apps.googleusercontent.com",
+  "GOOGLE_CLIENT_SECRET": "TROQUE_seu-client-secret",
+
+  "GF_DB_URL": "TROQUE_postgresql+psycopg2://usuario:senha@servidor.postgres.database.azure.com:5432/financie",
+
+  "APP_BASE_URL": "TROQUE_https://SEU-APP.azurewebsites.net",
+  "FRONTEND_ORIGINS": "TROQUE_https://SEU-APP.azurewebsites.net",
+  "POST_LOGIN_PATH": "/static/index.html",
+
+  "TRUSTED_PROXY_COUNT": "1",
+
+  "SESSION_COOKIE_SECURE": "true",
+  "SESSION_COOKIE_HTTPONLY": "true",
+  "SESSION_COOKIE_SAMESITE": "Lax",
+  "SESSION_LIFETIME_MINUTES": "120",
+  "WTF_CSRF_SSL_STRICT": "true",
+
+  "ENABLE_DEV_LOGIN": "false",
+  "DEV_LOGIN_RATE_LIMIT": "5 per minute",
+  "FLASK_DEBUG": "false",
+  "RATELIMIT_ENABLED": "true",
+  "RATELIMIT_STORAGE_URI": "memory://",
+
+  "OPENFINANCE_ENABLE_REAL": "false",
+  "OPENFINANCE_BASE_URL": "",
+  "OPENFINANCE_CLIENT_ID": "",
+  "OPENFINANCE_CLIENT_SECRET": "",
+  "OPENFINANCE_CERT_PATH": "",
+  "OPENFINANCE_KEY_PATH": "",
+  "OPENFINANCE_WEBHOOK_SECRET": "TROQUE_so-se-for-receber-webhooks",
+
+  "LOG_LEVEL": "INFO"
+}

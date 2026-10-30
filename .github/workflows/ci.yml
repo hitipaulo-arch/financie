@@ -1,0 +1,78 @@
+name: CI
+
+# Roda em todo pull request e em pushes na main.
+# O workflow de deploy (main_gestão.yml) também executa os mesmos gates antes
+# de publicar no Azure — defesa em profundidade: o CI dá feedback no PR e o
+# pipeline de deploy impede a publicação mesmo em caso de merge direto.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  security-and-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Mínimo exigido pelas dependências fixadas é Python 3.10;
+          # mantemos 3.11 para coincidir com o runtime do App Service.
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pip-audit
+
+      # 🔒 Bloqueia o merge se qualquer dependência do projeto (ou transitiva
+      # dela) tiver vulnerabilidade conhecida.
+      #
+      # Auditamos o requirements.txt, e não o ambiente inteiro: sem `-r` o
+      # pip-audit também avalia pip/setuptools/pip-audit instalados no runner,
+      # que são ferramental de build e não fazem parte do deploy — o resultado
+      # é falha permanente por ruído (aconteceu na primeira execução deste CI).
+      - name: Dependency audit (pip-audit)
+        run: pip-audit --strict --progress-spinner off -r requirements.txt
+
+      - name: Testes de regressão de segurança (pytest)
+        run: pytest -v
+
+      - name: Smoke test — o app sobe e as rotas críticas respondem
+        env:
+          APP_ENV: production
+          GF_DB_URL: sqlite:///ci_smoke.db
+          FLASK_SECRET_KEY: chave-apenas-para-ci
+        run: |
+          python - <<'PY'
+          import os, sys
+          from backend import create_app, IS_PRODUCTION, DEV_LOGIN_ENABLED
+
+          assert IS_PRODUCTION is True, "APP_ENV=production deveria implicar IS_PRODUCTION"
+          assert DEV_LOGIN_ENABLED is False, "dev-login nunca pode estar ativo em produção"
+
+          app = create_app()
+          client = app.test_client()
+
+          assert client.get("/api/health").status_code == 200, "health check falhou"
+          # Nenhum arquivo do projeto pode ser servido pela web
+          for path in ("/backend.py", "/requirements.txt", "/.git/config", "/.env.example"):
+              code = client.get(path).status_code
+              assert code == 404, f"{path} exposto pela web (HTTP {code})"
+          # Porta dos fundos de autenticação fechada
+          assert client.post("/auth/dev-login", json={"user_id": "x"}).status_code == 403
+          # Webhook fail-closed sem OPENFINANCE_WEBHOOK_SECRET
+          assert client.post("/api/openfinance/webhook", json={}).status_code == 503
+
+          print("smoke test OK —", len(list(app.url_map.iter_rules())), "rotas registradas")
+          PY
