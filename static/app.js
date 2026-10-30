@@ -19,6 +19,7 @@ const CSRF_HEADER = 'X-CSRFToken';
 const state = {
   user: null,
   csrfToken: null,
+  metodos: null,
   aba: 'painel',
   paginas: { transacoes: 1, parcelas: 1, investimentos: 1 },
   filtros: { asset_type: '', status: '' },
@@ -155,11 +156,53 @@ async function finalizar(resp, textoBruto) {
 /* --------------------------------------------------------------------------
    Sessão / telas
    -------------------------------------------------------------------------- */
+/** Usuário da entrada automática — é onde ficam os dados de demonstração. */
+const USUARIO_AUTOMATICO = 'dev';
+
+/**
+ * Uma tentativa por carga de página. Depois de um logout explícito a pessoa tem
+ * que ver a tela de login, não ser jogada de volta para dentro.
+ */
+let entradaAutomaticaTentada = false;
+
 function mostrarLogin() {
   state.user = null;
   $('#app').classList.add('oculto');
   $('#tela-login').classList.remove('oculto');
-  aplicarMetodosDeLogin();
+  $('#login-carregando').classList.add('oculto');
+  aplicarMetodosDeLogin(state.metodos);
+}
+
+/** Tela neutra enquanto a entrada automática roda, para o login não piscar. */
+function mostrarEntrando() {
+  $('#app').classList.add('oculto');
+  $('#tela-login').classList.remove('oculto');
+  for (const id of ['btn-google', 'painel-dev-login', 'login-erro', 'login-aviso']) {
+    $(`#${id}`).classList.add('oculto');
+  }
+  $('#login-carregando').classList.remove('oculto');
+}
+
+async function consultarMetodos() {
+  try {
+    const resp = await fetch('/auth/methods', { credentials: 'include' });
+    if (resp.ok) return await resp.json();
+  } catch {
+    /* sem rede: os chamadores tratam null como "não sei" */
+  }
+  return null;
+}
+
+/**
+ * Entrar sozinho só faz sentido quando não há escolha a fazer: o servidor
+ * oferece o login de desenvolvimento e não tem Google configurado.
+ *
+ * Em produção `/auth/methods` responde `dev_login: false` — a Fase 1 já ignora
+ * `ENABLE_DEV_LOGIN` lá —, então isto nunca dispara e a autenticação continua
+ * obrigatória. Nada aqui afrouxa a API: ela segue exigindo sessão e CSRF.
+ */
+function entradaAutomaticaDisponivel(metodos) {
+  return Boolean(metodos) && metodos.dev_login === true && metodos.google !== true;
 }
 
 /**
@@ -169,19 +212,14 @@ function mostrarLogin() {
  * GOOGLE_CLIENT_ID/SECRET não existem) e escondia o login sem Google dentro de um
  * <details> — justamente o caminho que funciona em ambiente de teste.
  */
-async function aplicarMetodosDeLogin() {
+async function aplicarMetodosDeLogin(metodos) {
   const google = $('#btn-google');
   const painel = $('#painel-dev-login');
   const alvoErro = $('#login-erro');
   const alvoAviso = $('#login-aviso');
 
-  let metodos = null;
-  try {
-    const resp = await fetch('/auth/methods', { credentials: 'include' });
-    if (resp.ok) metodos = await resp.json();
-  } catch {
-    metodos = null;
-  }
+  if (!metodos) metodos = await consultarMetodos();
+  state.metodos = metodos;
 
   if (!metodos) {
     // Não deu para consultar: mostra o caminho padrão em vez de deixar a pessoa
@@ -196,12 +234,9 @@ async function aplicarMetodosDeLogin() {
   if (metodos.dev_login) {
     alvoAviso.textContent = metodos.google
       ? 'Você também pode entrar com Google; o acesso sem conta usa apenas um nome de usuário.'
-      : 'Este servidor não tem Google configurado — entre com um nome de usuário abaixo.';
+      : `Este servidor não tem Google configurado: a página entra sozinha como `
+        + `"${USUARIO_AUTOMATICO}". Use o campo acima para entrar como outra pessoa.`;
     alvoAviso.classList.remove('oculto');
-    // Enter no campo também entra.
-    $('#dev-user').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); devLogin(); }
-    });
   }
 
   if (!metodos.google && !metodos.dev_login) {
@@ -210,6 +245,41 @@ async function aplicarMetodosDeLogin() {
       + 'Configure GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET, '
       + 'ou ENABLE_DEV_LOGIN=true fora de produção.';
     alvoErro.classList.remove('oculto');
+  }
+}
+
+/** Lê a sessão atual; devolve o usuário ou null. */
+async function lerSessao() {
+  try {
+    const eu = await fetch('/auth/me', { credentials: 'include' });
+    if (!eu.ok) return null;
+    state.user = await eu.json();
+    return state.user;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cria a sessão sem nenhuma interação e confirma que ela grudou.
+ *
+ * A confirmação não é frescura: com cookie de terceiro bloqueado (página dentro
+ * de iframe) o POST devolve 200 e o `/auth/me` seguinte devolve 401. Sem
+ * conferir, o painel abriria e cada chamada de API falharia em silêncio.
+ */
+async function entrarAutomaticamente() {
+  try {
+    const resp = await fetch('/auth/dev-login', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: USUARIO_AUTOMATICO }),
+    });
+    if (!resp.ok) return { ok: false, motivo: 'recusado', status: resp.status };
+    if (!(await lerSessao())) return { ok: false, motivo: 'cookie' };
+    return { ok: true };
+  } catch {
+    return { ok: false, motivo: 'rede' };
   }
 }
 
@@ -229,13 +299,35 @@ function mostrarApp() {
 }
 
 async function iniciar() {
-  try {
-    const eu = await fetch('/auth/me', { credentials: 'include' });
-    if (!eu.ok) { mostrarLogin(); return; }
-    state.user = await eu.json();
-  } catch {
-    mostrarLogin();
-    return;
+  if (!(await lerSessao())) {
+    const metodos = await consultarMetodos();
+    state.metodos = metodos;
+
+    if (entradaAutomaticaTentada || !entradaAutomaticaDisponivel(metodos)) {
+      mostrarLogin();
+      return;
+    }
+
+    entradaAutomaticaTentada = true;
+    mostrarEntrando();
+    const entrada = await entrarAutomaticamente();
+    if (!entrada.ok) {
+      mostrarLogin();
+      if (entrada.motivo === 'cookie') {
+        const alvoErro = $('#login-erro');
+        const alvoAviso = $('#login-aviso');
+        alvoErro.textContent =
+          'A entrada automática foi aceita pelo servidor, mas o navegador não devolveu '
+          + 'o cookie de sessão — a página está dentro de um quadro (iframe) de outro '
+          + 'site e os cookies de terceiros estão bloqueados.';
+        alvoErro.classList.remove('oculto');
+        alvoAviso.textContent =
+          'Como resolver: abra esta aplicação em uma aba própria do navegador; '
+          + 'lá ela entra sozinha, sem tela de login.';
+        alvoAviso.classList.remove('oculto');
+      }
+      return;
+    }
   }
 
   try {
@@ -939,6 +1031,11 @@ function ligarEventos() {
   $$('.aba').forEach((b) => b.addEventListener('click', () => trocarAba(b.dataset.aba)));
   $('#btn-logout').addEventListener('click', logout);
   $('#btn-dev-login').addEventListener('click', devLogin);
+  // Enter no campo de usuário também entra. Ligado uma única vez aqui: antes
+  // ficava dentro de aplicarMetodosDeLogin() e acumulava um listener por chamada.
+  $('#dev-user').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); devLogin(); }
+  });
 
   $('#form-transacao').addEventListener('submit', salvarTransacao);
   $('#btn-transacao-cancelar').addEventListener('click', resetarFormTransacao);

@@ -410,3 +410,87 @@ def test_frontend_confere_se_a_sessao_grudou_apos_o_login():
     )
     assert "iframe" in corpo.lower(), "a mensagem precisa citar o quadro/iframe"
     assert "429" in corpo, "o 429 do rate limit precisa ter mensagem própria"
+
+
+# ---------------------------------------------------------------------------
+# Entrada direta (sem clicar em login)
+# ---------------------------------------------------------------------------
+def test_frontend_entra_sozinho_quando_nao_ha_escolha():
+    """Sem Google configurado e com dev-login liberado, a página abre no painel."""
+    js = ler("app.js")
+    assert "entrarAutomaticamente" in js, "falta a entrada automática"
+    assert "USUARIO_AUTOMATICO" in js
+    assert "entradaAutomaticaDisponivel" in js
+
+
+def test_entrada_automatica_e_condicionada_aos_metodos_do_servidor():
+    """O gatilho tem que depender do que o servidor anuncia — nunca ser fixo.
+
+    Se disparasse sempre, em produção a página tentaria o dev-login, levaria 403
+    e o usuário ficaria preso numa tela de erro.
+    """
+    js = ler("app.js")
+    corpo = js[js.index("function entradaAutomaticaDisponivel"):]
+    corpo = corpo[:corpo.index("\n}")]
+    assert "metodos.dev_login === true" in corpo
+    assert "metodos.google !== true" in corpo, (
+        "com Google configurado a pessoa deve escolher, não cair direto numa conta"
+    )
+
+
+def test_entrada_automatica_confirma_que_a_sessao_grudou():
+    js = ler("app.js")
+    corpo = js[js.index("async function entrarAutomaticamente"):]
+    corpo = corpo[:corpo.index("\n}\n")]
+    assert "lerSessao()" in corpo, "precisa conferir /auth/me depois do POST"
+    assert "'cookie'" in corpo, "o motivo do fracasso tem que distinguir cookie bloqueado"
+
+
+def test_entrada_automatica_so_tenta_uma_vez_por_carga():
+    """Depois de logout explícito a pessoa vê a tela de login, não é jogada de volta."""
+    js = ler("app.js")
+    assert "entradaAutomaticaTentada" in js
+    corpo = js[js.index("async function iniciar"):]
+    corpo = corpo[:corpo.index("\n}\n")]
+    assert "entradaAutomaticaTentada" in corpo
+
+
+def test_entrar_direto_nao_abre_a_api(app_env):
+    """Entrar sem clicar é conveniência de UI — a API segue exigindo sessão.
+
+    Este é o ponto que não pode se perder: a Fase 1 fechou justamente um bypass
+    que deixava qualquer um assumir a sessão de um user_id arbitrário.
+    """
+    _, app = app_env
+    anonimo = app.test_client()
+    for caminho in ("/api/users/dev/summary", "/api/users/dev/transactions",
+                    "/api/users/dev/investments", "/api/users/dev/installments"):
+        assert anonimo.get(caminho).status_code == 401, (
+            f"{caminho} respondeu sem sessão"
+        )
+    escrita = anonimo.post("/api/users/dev/transactions",
+                           json={"description": "x", "amount": 1, "type": "expense"})
+    assert escrita.status_code in (400, 401), "escrita anônima não pode passar"
+
+
+def test_o_botao_do_google_nao_aparece_sem_credenciais(app_env):
+    """Neste servidor o Google não está configurado: a tela não pode oferecê-lo.
+
+    Antes o botão ficava sempre visível e respondia 500 (oauth_config_missing) —
+    foi o que apareceu no log quando a entrada sem Google falhou.
+    """
+    _, app = app_env
+    corpo = app.test_client().get("/auth/methods").get_json()
+    assert corpo["google"] is False, "o fixture não configura GOOGLE_CLIENT_ID/SECRET"
+    assert corpo["dev_login"] is True
+    # e a resposta que o frontend recebe é o que manda esconder o botão
+    html = ler("index.html")
+    bloco = re.search(r'<a[^>]*id="btn-google"[^>]*>', html).group(0)
+    assert "oculto" in bloco
+
+
+def test_tela_de_entrada_automatica_existe_no_html():
+    html = ler("index.html")
+    assert 'id="login-carregando"' in html, (
+        "sem isto a tela de login pisca antes de o painel abrir sozinho"
+    )
