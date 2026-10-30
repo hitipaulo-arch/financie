@@ -1,8 +1,8 @@
 # Gestor Financeiro (Backend + Frontend)
 
 Aplicação para gestão de finanças pessoais com:
-- Frontend HTML + Tailwind + Google OAuth
-- Backend Flask com persistência em SQLite e API REST
+- Frontend em HTML/CSS/JS puro, servido pelo próprio Flask em `/static/index.html`
+- Backend Flask com persistência em SQLite ou PostgreSQL e API REST
 - Autenticação via Google OAuth 2.0
 
 ## Arquitetura
@@ -11,7 +11,7 @@ Aplicação para gestão de finanças pessoais com:
 | Backend | Flask + SQLAlchemy | API REST, persistência em `data.db` |
 | Autenticação | Authlib + Google OAuth | Login com conta Google |
 | Serialização | Marshmallow | Validação e formatação JSON |
-| Frontend | `index_api.html` | Interface REST com sessão autenticada |
+| Frontend | `static/index.html` + `app.js` + `styles.css` | SPA em JS puro, sem build; consome a API com sessão autenticada e CSRF |
 | Importação Simulada | Endpoint `/api/users/<user_id>/import` | Gera transações fictícias (Open Finance) |
 | Open Finance Sync | Endpoint `/api/users/<user_id>/openfinance/sync` | Sincroniza transações via Open Finance (simulado) |
 | Provider Abstração | `providers.py` | Facilita troca de provedor (simulado → real) |
@@ -91,7 +91,14 @@ pytest tests/ -v
 pytest tests/ -v --cov=backend --cov-report=term-missing
 ```
 
-**Resultado esperado:** 31 testes passando (`tests/test_phase1_security.py`).
+**Resultado esperado:** todos os testes passando.
+
+| Arquivo | O que cobre |
+| --- | --- |
+| `tests/test_phase1_security.py` | Regressões de segurança da Fase 1 (exposição de arquivos, dev-login, erros genéricos, webhook, dependências) |
+| `tests/test_phase2_api.py` | Contrato da API da Fase 2 (CSRF, sessão de banco, rate limit, CORS, redirects) |
+| `tests/test_phase2_frontend.py` | Frontend de referência e o fluxo completo que ele executa |
+| `tests/test_deploy_config.py` | Artefatos de deploy (template de app settings do Azure, `startup.txt`) |
 
 A auditoria de dependências roda localmente com:
 ```powershell
@@ -102,15 +109,74 @@ pip-audit --strict -r requirements.txt
 > Ambos os comandos também rodam no GitHub Actions antes do deploy para o
 > Azure (job `build`), e **bloqueiam a publicação** em caso de falha.
 
+## Deploy (Azure App Service)
+
+O workflow `.github/workflows/main_gestão.yml` faz o build e o publish, mas **não
+configura as variáveis de ambiente nem o comando de inicialização** — sem isso a
+app sobe, responde 200 no health check e não funciona para ninguém.
+
+Tudo o que é preciso está em **[`deploy/README.md`](deploy/README.md)**:
+
+- `deploy/azure-appsettings.example.json` — template completo das 25+ variáveis
+  que o backend lê, com o valor de produção recomendado para cada uma
+  (placeholders marcados com `TROQUE_`);
+- referências a **Key Vault** para os segredos;
+- comando de inicialização e as armadilhas que derrubam o deploy
+  (`--bind 0.0.0.0:8000`, `wsgi:app` e não `backend:app`, Startup Command do
+  portal sobrescrevendo o `startup.txt`);
+- escolha do banco (SQLite em `/home/data` para avaliação, PostgreSQL em
+  produção) — o código é portátil entre os dois;
+- **checklist pós-deploy** com os `curl` esperados e uma tabela de diagnóstico
+  por sintoma.
+
 ## Base de Dados
 SQLite criada automaticamente (`data.db`). Para redefinir: apagar o ficheiro antes de iniciar.
 
-## Arquivos Estáticos
+## Arquivos Estáticos e Frontend
 Somente o conteúdo de `static/` é servido pela web, sob `/static/<arquivo>`.
 
 > ⚠️ **Não** volte a configuração para `static_folder='.'`: isso expõe pela web
 > qualquer arquivo da raiz do projeto (`backend.py`, `.env`, `.git/config`).
 > Coloque o frontend dentro de `static/`.
+
+### O frontend de referência
+
+`static/` contém a interface que consome esta API — **HTML, CSS e JavaScript
+puros, sem build, sem npm e sem CDN**. Basta servir o app e abrir
+`/static/index.html` no navegador.
+
+| Arquivo | Papel |
+| --- | --- |
+| `static/index.html` | Estrutura: tela de login, abas, formulários e tabelas |
+| `static/styles.css` | Tema escuro em CSS puro (variáveis CSS, sem framework) |
+| `static/app.js` | Toda a lógica: CSRF, CRUD, painel, Open Finance |
+
+Cobertura funcional:
+
+- **Login** com Google (`/auth/login`) e, quando `ENABLE_DEV_LOGIN=true` em
+  desenvolvimento, o botão *Entrar como dev*.
+- **Painel** com resumo (renda, despesas avulsas, parcelas, saldo), sugestões
+  geradas pelo backend e portfólio de investimentos.
+- **CRUD completo** de transações, compras parceladas e investimentos, com
+  filtros (`asset_type`, `status`) e paginação.
+- **Open Finance**: criação de consentimento e sincronização, listando as
+  sugestões importadas.
+
+O frontend é a implementação de referência do contrato de segurança da Fase 2 e
+serve de exemplo para qualquer cliente:
+
+1. `GET /api/csrf-token` ao carregar a página — e **rejeita** o valor literal
+   `N/A` que o endpoint devolvia antes da correção.
+2. Envia o header **`X-CSRFToken`** em toda escrita (`POST`/`PUT`/`PATCH`/`DELETE`).
+3. Usa `credentials: 'include'` para o cookie de sessão viajar.
+4. Se uma escrita devolver **400 por CSRF**, renova o token e tenta **uma** vez.
+5. Todas as URLs são **relativas** — o mesmo código roda em `localhost` e no
+   Azure sem alteração.
+6. Renderiza os `details` do Marshmallow em erros de validação e o `error_id` em
+   erros 500 (para cruzar com o log), **sem** expor stack trace.
+
+Como o backend serve o frontend, `FRONTEND_ORIGINS` em produção precisa conter
+apenas o domínio do próprio app — não há origem diferente para autorizar.
 
 ## Endpoints de Autenticação
 | Método | Endpoint | Descrição |
