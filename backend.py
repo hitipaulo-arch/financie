@@ -760,10 +760,31 @@ def create_app() -> Flask:
         return jsonify({"status": "ok"})
 
     @app.route("/")
-    @require_auth
-    @limiter.exempt  # descoberta da API / probe de raiz
+    @limiter.exempt  # entrada da aplicação: não pode consumir cota nem levar 429
     def root():
-        return jsonify({"message": "Gestor Financeiro API", "health": "/api/health"}), 200
+        """Raiz serve o frontend.
+
+        Antes era `@require_auth` devolvendo um JSON de descoberta da API, então
+        abrir a aplicação no navegador sem sessão respondia **401** — justamente a
+        primeira coisa que alguém vê ao acessar a URL. O frontend tem sua própria
+        tela de login e cada chamada de API continua protegida por sessão + CSRF,
+        então a raiz precisa ser pública.
+
+        A descoberta da API mudou para `/api`.
+        """
+        return app.send_static_file("index.html")
+
+    @app.route("/api")
+    @limiter.exempt
+    def api_index():
+        """Descoberta da API (o que a raiz devolvia antes)."""
+        return jsonify({
+            "message": "Gestor Financeiro API",
+            "ui": "/",
+            "health": "/api/health",
+            "csrf_token": "/api/csrf-token",
+            "auth": "/auth/me",
+        }), 200
 
     # -------------------------------------------------------------------
     # Autenticação Google OAuth

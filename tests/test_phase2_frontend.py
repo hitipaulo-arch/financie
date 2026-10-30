@@ -69,6 +69,42 @@ def test_index_referencia_os_outros_assets(app_env):
 
 
 # ---------------------------------------------------------------------------
+# A raiz da aplicação
+# ---------------------------------------------------------------------------
+def test_raiz_serve_o_frontend_sem_precisar_de_sessao(app_env):
+    """Abrir a URL da aplicação no navegador não pode responder 401.
+
+    A raiz era `@require_auth` com um JSON de descoberta: quem acessava sem sessão
+    — o caso de todo visitante novo — recebia um erro em vez da tela de login.
+    """
+    _, app = app_env
+    resp = app.test_client().get("/")
+    assert resp.status_code == 200, resp.get_data(as_text=True)[:120]
+    assert "text/html" in resp.content_type
+    corpo = resp.get_data(as_text=True)
+    assert "/static/app.js" in corpo, "a raiz não entregou o frontend"
+
+
+def test_raiz_nao_exige_autenticacao_mas_as_apis_sim(app_env):
+    _, app = app_env
+    c = app.test_client()
+    assert c.get("/").status_code == 200
+    assert c.get("/api/health").status_code == 200
+    assert c.get("/api/users/u1/summary").status_code == 401, (
+        "servir a raiz sem auth não pode afrouxar a proteção das APIs"
+    )
+
+
+def test_descoberta_da_api_mudou_para_api(app_env):
+    _, app = app_env
+    resp = app.test_client().get("/api")
+    assert resp.status_code == 200
+    corpo = resp.get_json()
+    assert corpo["health"] == "/api/health"
+    assert corpo["ui"] == "/"
+
+
+# ---------------------------------------------------------------------------
 # Regressão do redirect pós-login que dava 404
 # ---------------------------------------------------------------------------
 def test_destino_padrao_do_redirect_pos_login_existe(app_env):
