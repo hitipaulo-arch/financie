@@ -17,9 +17,20 @@ Aplicação para gestão de finanças pessoais com:
 | Provider Abstração | `providers.py` | Facilita troca de provedor (simulado → real) |
 
 ## Instalação
-No diretório `gestor-financeiro`:
+Requer **Python 3.10 ou mais novo** (é o mínimo que os pinos de
+`requirements.txt` aceitam).
+
+Os launchers da seção **Executar** criam o ambiente virtual e instalam as
+dependências sozinhos — normalmente você não precisa destes passos. Para fazer à
+mão:
+
 ```powershell
-pip install -r requirements.txt
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt    # Windows
+```
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt        # Linux / macOS
 ```
 
 ## Configuração OAuth
@@ -53,17 +64,63 @@ print(secrets.token_hex(32))
 ```
 
 ## Executar Backend
-```powershell
-python backend.py
-```
-Serve em `http://localhost:5000`.
 
-Para desenvolvimento local com login sem Google:
+### Jeito curto: os launchers
+
 ```powershell
-$env:APP_ENV = "development"
-$env:ENABLE_DEV_LOGIN = "true"
-python backend.py
+start_backend.bat          # Windows — dá para executar com duplo clique
 ```
+```bash
+./run.sh                   # Linux / macOS / WSL
+```
+
+Os dois fazem exatamente o mesmo, nesta ordem, e são **idempotentes** — da
+segunda vez em diante só sobem o servidor:
+
+1. Acham o Python e conferem se é **3.10+** (o mínimo dos pinos em `requirements.txt`).
+2. Criam `.venv/` se não existir.
+3. Instalam `requirements.txt` **só quando o arquivo mudou** — o carimbo é um
+   SHA-256 gravado em `.venv/.requirements-sha256`, calculado pelo mesmo
+   one-liner Python nos dois sistemas (nada de `certutil` num e `sha256sum` no
+   outro, que divergem em formato).
+4. Criam um `.env` de desenvolvimento **se não existir um**, com
+   `APP_ENV=development`, `ENABLE_DEV_LOGIN=true` e uma `FLASK_SECRET_KEY`
+   gerada por `secrets.token_hex(32)`. O seu `.env` nunca é modificado. Sem
+   chave fixa o backend gera uma aleatória a cada start e registra `CRITICAL`:
+   sessão e token CSRF morrem em todo restart.
+5. Rodam `alembic upgrade head`.
+6. Sobem o servidor em **`http://127.0.0.1:5000`**.
+
+| Opção | Efeito |
+|---|---|
+| `--port 8080` | muda a porta (padrão `5000`) |
+| `--host 0.0.0.0` | muda o bind (padrão `127.0.0.1`) |
+| `--reinstall` | força a reinstalação das dependências |
+| `--no-migrate` | pula o `alembic upgrade head` |
+| `--help` | imprime o resumo |
+
+Precedência das variáveis, da mais forte para a mais fraca: **o seu ambiente →
+o `.env` → o padrão do script**. Definir `PORT` no shell e rodar sem `--port`
+respeita o seu `PORT`.
+
+> **`127.0.0.1` e não `0.0.0.0` é deliberado.** O default do `backend.py` é
+> `0.0.0.0`, o que exporia na rede local um servidor com `ENABLE_DEV_LOGIN=true`
+> — e esse endpoint permite assumir a sessão de qualquer `user_id`. Passe
+> `--host 0.0.0.0` conscientemente se precisar.
+
+> **O bind em loopback também explica por que o launcher não serve para o
+> preview/produção.** Nesses casos o bind precisa ser `0.0.0.0` e o servidor é o
+> gunicorn — veja `startup.txt` e `deploy/README.md`.
+
+### Jeito longo: à mão
+
+```bash
+APP_ENV=development ENABLE_DEV_LOGIN=true .venv/bin/python backend.py
+```
+
+Sem `APP_ENV` o backend assume **produção** (fail-closed): o dev-login é
+desativado e o cookie de sessão sai marcado como `Secure`. É por isso que os
+launchers definem o ambiente em vez de só chamar `python backend.py`.
 
 O modo debug do Werkzeug **fica desligado por padrão** (`FLASK_DEBUG=true` para
 ligar). Ele nunca deve ser ativado num host acessível: o console interativo
@@ -74,9 +131,15 @@ Host/porta configuráveis por `FLASK_RUN_HOST` e `PORT`.
 **Entry points:**
 | Uso | Comando |
 |-----|---------|
+| Desenvolvimento (Windows) | `start_backend.bat` |
+| Desenvolvimento (Linux/macOS) | `./run.sh` |
 | Produção (Azure/gunicorn) | `gunicorn ... wsgi:app` (ver `startup.txt`) |
 | Flask CLI | `flask --app backend:create_app run` |
-| Desenvolvimento | `python backend.py` |
+| Direto | `python backend.py` |
+
+> O `start_backend.bat` usa o servidor de desenvolvimento do Flask, não o
+> gunicorn: o gunicorn depende de `os.fork()` e **não roda em Windows nativo**.
+> Em produção o alvo é Linux/Azure, onde `startup.txt` usa gunicorn normalmente.
 
 > O módulo `backend` **não** cria o app no import (`from backend import Base`,
 > usado pelo Alembic, não abre mais conexão com o banco). `backend.app` ainda
@@ -592,8 +655,9 @@ importada a trazia de volta na sincronização seguinte.
 3. ~~Considerar parcelas corretamente no summary~~ — **feito** (Fase 3) · marcar
    parcelas concluídas no registro — pendente
 4. Exportação CSV / Excel
-5. ~~Testes automatizados~~ — **144 testes** cobrindo resumo, sugestões,
-   portfólio, validação, migrações e frontend
+5. ~~Testes automatizados~~ — **197 testes** cobrindo resumo, sugestões,
+   portfólio, validação, migrações, frontend, configuração de deploy e os
+   launchers de desenvolvimento
 6. ~~Rate limiting e logging estruturado (JSON)~~ — **feito**
 7. ~~`Numeric(14,2)` para valores monetários + migração dos dados existentes~~ —
    **feito** (Fase 3, com `NUMERIC(20,8)` para quantidade/cotação de ativo)

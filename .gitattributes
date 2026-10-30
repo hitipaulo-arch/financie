@@ -1,0 +1,30 @@
+# Finais de linha por tipo de arquivo.
+#
+# Isto não é cosmético, é corretivo:
+#   - um `run.sh` com CRLF falha no Linux/macOS com
+#     "bad interpreter: /bin/bash^M: no such file or directory"
+#   - um `start_backend.bat` com LF é tratado de forma inconsistente pelo cmd.exe
+#     (rótulos e `goto` podem não resolver)
+# Sem estas regras, quem clona no Windows e commita de volta converte os dois e
+# quebra o script do outro sistema — e nada nos testes pega, porque o arquivo
+# continua "funcionando" na máquina de quem o quebrou.
+#
+# Deliberadamente pontual: nada de `* text=auto`, que renormalizaria o
+# repositório inteiro (há arquivo com finais mistos) e produziria um diff enorme
+# sem relação com a mudança em curso.
+
+*.sh   text eol=lf
+*.bash text eol=lf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# Binários: nunca tocar.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.db   binary
+*.sqlite3 binary
+*.pem  binary
+*.key  binary
